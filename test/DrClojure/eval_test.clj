@@ -86,3 +86,62 @@
       (is (not= :timeout res))
       (is (= :interrupted (:status res)))
       (is (false? (sut/evaluating? ctx))))))
+
+(deftest test-async-eval-stdin-eof
+  (testing "push-stdin-eof! sends EOF causing read-line to return nil"
+    (let [ctx (sut/make-eval-context)
+          completed (promise)]
+      (sut/eval-async ctx "(let [line (read-line)] line)"
+        {:on-complete (fn [res] (deliver completed res))})
+      (Thread/sleep 150)
+      (is (sut/waiting-for-input? ctx))
+      (sut/push-stdin-eof! ctx)
+      (let [res (deref completed 3000 :timeout)]
+        (is (= :ok (:status res)))
+        (is (nil? (:value res)))
+        (is (false? (sut/waiting-for-input? ctx))))))
+
+  (testing "Multiple read-lines after EOF all return nil without blocking"
+    (let [ctx (sut/make-eval-context)
+          completed (promise)]
+      (sut/eval-async ctx "(let [l1 (read-line) l2 (read-line) l3 (read-line)] [l1 l2 l3])"
+        {:on-complete (fn [res] (deliver completed res))})
+      (Thread/sleep 150)
+      (is (sut/waiting-for-input? ctx))
+      (sut/push-stdin-eof! ctx)
+      (let [res (deref completed 3000 :timeout)]
+        (is (= :ok (:status res)))
+        (is (= [nil nil nil] (:value res)))
+        (is (false? (sut/waiting-for-input? ctx))))))
+
+  (testing "Pushed text followed by push-stdin-eof! returns text then nil"
+    (let [ctx (sut/make-eval-context)
+          completed (promise)]
+      (sut/eval-async ctx "(let [l1 (read-line) l2 (read-line)] [l1 l2])"
+        {:on-complete (fn [res] (deliver completed res))})
+      (Thread/sleep 150)
+      (sut/push-stdin! ctx "first-line")
+      (sut/push-stdin-eof! ctx)
+      (let [res (deref completed 3000 :timeout)]
+        (is (= :ok (:status res)))
+        (is (= ["first-line" nil] (:value res)))
+        (is (false? (sut/waiting-for-input? ctx))))))
+
+  (testing "Sequential evaluations each have fresh stdin streams after EOF"
+    (let [ctx (sut/make-eval-context)
+          c1 (promise)
+          c2 (promise)]
+      (sut/eval-async ctx "(read-line)"
+        {:on-complete (fn [res] (deliver c1 res))})
+      (Thread/sleep 150)
+      (sut/push-stdin-eof! ctx)
+      (is (= nil (:value (deref c1 3000 :timeout))))
+      ;; Second evaluation
+      (sut/eval-async ctx "(read-line)"
+        {:on-complete (fn [res] (deliver c2 res))})
+      (Thread/sleep 150)
+      (is (sut/waiting-for-input? ctx))
+      (sut/push-stdin! ctx "second-run")
+      (let [res (deref c2 3000 :timeout)]
+        (is (= :ok (:status res)))
+        (is (= "second-run" (:value res)))))))

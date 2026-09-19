@@ -58,7 +58,9 @@
                  (let [item (try (.take queue) (catch InterruptedException _ ::eof))]
                    (when on-wait-input (on-wait-input false))
                    (if (or (identical? item ::eof) (nil? item) @closed-atom)
-                     -1
+                     (do
+                       (reset! closed-atom true)
+                       -1)
                      (do
                        (reset! current-rdr-atom (StringReader. (str item)))
                        (recur)))))
@@ -165,6 +167,11 @@
   [{:keys [queue]} text]
   (.offer queue (str text "\n")))
 
+(defn push-stdin-eof!
+  "Pushes an EOF signal to the context's standard input queue."
+  [{:keys [queue]}]
+  (.offer queue ::eof))
+
 (defn waiting-for-input?
   "Returns true if user code is currently blocked waiting for stdin."
   [{:keys [waiting-input?]}]
@@ -211,6 +218,10 @@
       (when on-output (on-output "; [Warning: Evaluation already in progress. Press Stop to cancel.]\n"))
       nil)
     (let [completed-atom (atom false)
+          _ (.clear queue)
+          _ (reset! current-rdr (StringReader. ""))
+          _ (reset! closed? false)
+          _ (reset! waiting-input? false)
           safe-complete (fn [res]
                           (when (compare-and-set! completed-atom false true)
                             (when on-complete (on-complete res))))

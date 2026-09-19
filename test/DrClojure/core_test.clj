@@ -4,7 +4,7 @@
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
   (:import (java.awt Font)
-           (java.awt.event KeyEvent)
+           (java.awt.event ActionEvent KeyEvent)
            (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList JTextArea JTextField JComponent JLabel SwingUtilities DefaultListModel)
            (javax.swing.text DefaultStyledDocument)))
 
@@ -1003,5 +1003,54 @@
           (.setText input-field korean-repl)
           (is (= korean-repl (.getText input-field)))
           (is (.contains (.getText input-field) "안녕하세요 세계!")))
+        (finally
+          (.dispose frame))))))
+
+(deftest stdin-ctrl-d-eof-test
+  (testing "Pressing Ctrl+D in stdin textfield sends EOF and unblocks evaluation"
+    (let [frame (ui/create-ide nil)]
+      (try
+        (let [pane (.getContentPane frame)
+              components (tree-seq #(instance? java.awt.Container %) #(.getComponents %) pane)
+              input-field (first (filter #(and (instance? JTextField %) (= "repl-input" (.getName %))) components))
+              output-area (first (filter #(and (instance? JTextArea %) (= "output-area" (.getName %))) components))]
+          (is (some? input-field))
+          (is (some? output-area))
+
+          ;; Test 1: Empty textfield + Ctrl+D via ActionMap
+          (.setText input-field "(let [s (read-line)] (str \"got: \" (pr-str s)))")
+          (doseq [al (.getActionListeners input-field)]
+            (.actionPerformed al (ActionEvent. input-field ActionEvent/ACTION_PERFORMED "enter")))
+          (Thread/sleep 300)
+
+          (let [am (.getActionMap input-field)
+                act (.get am "stdin-eof")]
+            (is (some? act))
+            (.actionPerformed act (ActionEvent. input-field ActionEvent/ACTION_PERFORMED "stdin-eof")))
+          (Thread/sleep 400)
+          (is (.contains (.getText output-area) "got: nil"))
+
+          ;; Test 2: Text in field + Ctrl+D via KeyEvent
+          (.setText input-field "(let [l1 (read-line) l2 (read-line)] (str l1 \":\" (pr-str l2)))")
+          (doseq [al (.getActionListeners input-field)]
+            (.actionPerformed al (ActionEvent. input-field ActionEvent/ACTION_PERFORMED "enter")))
+          (Thread/sleep 300)
+          (.setText input-field "user-input-line")
+          (let [ctrl-d (KeyEvent. input-field KeyEvent/KEY_PRESSED (System/currentTimeMillis)
+                                  KeyEvent/CTRL_DOWN_MASK KeyEvent/VK_D (char 4))]
+            (doseq [kl (.getKeyListeners input-field)]
+              (.keyPressed kl ctrl-d))
+            (is (.isConsumed ctrl-d)))
+          (Thread/sleep 400)
+          (is (.contains (.getText output-area) "user-input-line:nil"))
+
+          ;; Test 3: Ctrl+D when not waiting for input does not send EOF or disrupt REPL
+          (.setText input-field "(+ 10 20)")
+          (let [ctrl-d (KeyEvent. input-field KeyEvent/KEY_PRESSED (System/currentTimeMillis)
+                                  KeyEvent/CTRL_DOWN_MASK KeyEvent/VK_D (char 4))]
+            (doseq [kl (.getKeyListeners input-field)]
+              (.keyPressed kl ctrl-d)))
+          ;; input-field text should not be cleared since it's not waiting for stdin
+          (is (= "(+ 10 20)" (.getText input-field))))
         (finally
           (.dispose frame))))))

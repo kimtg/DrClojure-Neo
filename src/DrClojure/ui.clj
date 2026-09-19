@@ -1536,7 +1536,8 @@
 
         ;; Components: Output & REPL input
         output-area (JTextArea. 10 80)
-        _ (do (.setEditable output-area false)
+        _ (do (.setName output-area "output-area")
+              (.setEditable output-area false)
               (.setBackground output-area (Color. 250 250 250))
               (.setForeground output-area (Color. 30 30 30)))
         output-scroll (JScrollPane. output-area)
@@ -1729,7 +1730,18 @@
                     (autocomplete-action! []
                       (if (.hasFocus input-field)
                         (repl-autocomplete-action!)
-                        (trigger-autocomplete! editor set-status! active-popup highlight-now! update-dirty!)))]
+                        (trigger-autocomplete! editor set-status! active-popup highlight-now! update-dirty!)))
+
+                    (send-stdin-eof! []
+                      (when (eval/waiting-for-input? eval-ctx)
+                        (when @active-popup
+                          (dismiss-autocomplete! active-popup))
+                        (let [text (.getText input-field)]
+                          (.setText input-field "")
+                          (when-not (empty? text)
+                            (append-output! (str text "\n"))
+                            (eval/push-stdin! eval-ctx text))
+                          (eval/push-stdin-eof! eval-ctx))))]
 
               (let [find-ctrl (create-find-replace-panel editor highlight-now! update-title! set-status!)
                     find-panel (:panel find-ctrl)
@@ -1755,7 +1767,15 @@
                       (actionPerformed [e]
                         (if @active-popup
                           (commit-autocomplete! active-popup)
-                          (repl-autocomplete-action!))))))
+                          (repl-autocomplete-action!)))))
+
+                  ;; Ctrl+D in stdin textfield sends EOF
+                  (.put im (KeyStroke/getKeyStroke "control D") "stdin-eof")
+                  (.put im (KeyStroke/getKeyStroke KeyEvent/VK_D KeyEvent/CTRL_DOWN_MASK) "stdin-eof")
+                  (.put am "stdin-eof"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e]
+                        (send-stdin-eof!)))))
 
                 ;; --- Input Field Action (REPL & Stdin) ---
                 (.addActionListener input-field
@@ -1777,20 +1797,26 @@
                                 (append-output! (str "> " text "\n"))
                                 (run-code-string! text)))))))))
 
-                ;; History navigation on Up / Down arrow
+                ;; History navigation on Up / Down arrow & Ctrl+D EOF
                 (.addKeyListener input-field
                   (proxy [KeyAdapter] []
                     (keyPressed [e]
-                      (when-not (or (.isConsumed e) @active-popup)
+                      (when-not (.isConsumed e)
                         (cond
-                          (= (.getKeyCode e) KeyEvent/VK_UP)
+                          (and (= (.getKeyCode e) KeyEvent/VK_D)
+                               (pos? (bit-and (.getModifiersEx e) KeyEvent/CTRL_DOWN_MASK)))
+                          (when (eval/waiting-for-input? eval-ctx)
+                            (.consume e)
+                            (send-stdin-eof!))
+
+                          (and (not @active-popup) (= (.getKeyCode e) KeyEvent/VK_UP))
                           (do
                             (.consume e)
                             (let [[new-hist display-text] (eval/history-prev @(:history eval-ctx) (.getText input-field))]
                               (reset! (:history eval-ctx) new-hist)
                               (.setText input-field display-text)))
 
-                          (= (.getKeyCode e) KeyEvent/VK_DOWN)
+                          (and (not @active-popup) (= (.getKeyCode e) KeyEvent/VK_DOWN))
                           (do
                             (.consume e)
                             (let [[new-hist display-text] (eval/history-next @(:history eval-ctx))]
