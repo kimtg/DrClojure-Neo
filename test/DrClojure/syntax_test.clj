@@ -1,6 +1,7 @@
 (ns DrClojure.syntax-test
   (:require [clojure.test :refer [deftest is testing]]
-             [DrClojure.syntax :as syntax])
+            [clojure.string :as str]
+            [DrClojure.syntax :as syntax])
   (:import (javax.swing.text DefaultStyledDocument StyleConstants SimpleAttributeSet)
            (javax.swing JTextPane)
            (java.awt Color)))
@@ -684,6 +685,79 @@
             (is (= :user (:category match)))))
         (finally
           (ns-unmap *ns* test-sym))))))
+
+  (testing "Returns all candidates with proper ordering when prefix is blank"
+    (binding [*ns* (find-ns 'user)]
+      (let [candidates (syntax/get-autocomplete-candidates "")]
+        (is (> (count candidates) 600))
+        ;; First candidates are special forms (e.g. def, fn, let, etc.)
+        (is (= :special (:category (first candidates))))
+        ;; Special forms come before builtins
+        (let [categories (map :category candidates)
+              first-builtin (first (keep-indexed (fn [idx cat] (when (= cat :builtin) idx)) categories))
+              last-special (last (keep-indexed (fn [idx cat] (when (= cat :special) idx)) categories))]
+          (is (some? first-builtin))
+          (is (some? last-special))
+          (is (< last-special first-builtin))))))
+
+  (testing "Prioritizes user definitions when prefix is blank"
+    (binding [*ns* (find-ns 'user)]
+      (let [buffer "(defn my-blank-test-fn [] nil)\n"
+            candidates (syntax/get-autocomplete-candidates "" buffer 0)]
+        (is (= "my-blank-test-fn" (:symbol (first candidates))))
+        (is (= :user (:category (first candidates)))))))
+
+  (testing "Blank prefix candidate resolution executes 100 queries in < 50ms"
+    (binding [*ns* (find-ns 'user)]
+      (let [buffer "(defn my-blank-test-fn [] nil)\n"]
+        (dotimes [_ 10]
+          (syntax/get-autocomplete-candidates "" buffer 0))
+        (let [start (System/nanoTime)]
+          (dotimes [_ 100]
+            (syntax/get-autocomplete-candidates "" buffer 0))
+          (let [elapsed-ms (/ (- (System/nanoTime) start) 1000000.0)]
+            (is (< elapsed-ms 50.0) (str "Elapsed time was " elapsed-ms " ms for 100 blank prefix calls")))))))
+
+(deftest background-cache-and-performance-test
+  (testing "warm-buffer-cache-async! asynchronously populates buffer-symbols-cache"
+    (let [code "(defn async-cache-target [a b] (+ a b))\n(def async-cache-val 42)\n"
+          fut (syntax/warm-buffer-cache-async! code)]
+      (when fut (.get ^java.util.concurrent.Future fut))
+      (let [cached (syntax/get-cached-or-compute-buffer-symbols code)]
+        (is (contains? (:defs cached) "async-cache-target"))
+        (is (contains? (:defs cached) "async-cache-val"))
+        (is (contains? (:all-tokens cached) "async-cache-target"))
+        (is (contains? (:all-tokens cached) "async-cache-val")))))
+
+  (testing "get-cached-symbol-doc retrieves and caches documentation"
+    (let [doc-info (syntax/get-cached-symbol-doc "map")]
+      (is (= :found (:status doc-info)))
+      (is (= "map" (:symbol doc-info)))
+      ;; Cache hit
+      (is (identical? doc-info (syntax/get-cached-symbol-doc "map"))))
+    (let [code "(defn cached-helper \"Helper doc\" [x] (inc x))\n"
+          doc-info (syntax/get-cached-symbol-doc "cached-helper" code 0)]
+      (is (= :buffer-def (:status doc-info)))
+      (is (= "cached-helper" (:symbol doc-info)))
+      (is (= "Helper doc" (:doc doc-info)))
+      ;; Cache hit
+      (is (identical? doc-info (syntax/get-cached-symbol-doc "cached-helper" code 0)))))
+
+  (testing "Autocomplete candidate resolution executes 100 queries in < 100ms (< 1ms per keystroke)"
+    (let [buffer (str/join "\n" (for [i (range 400)]
+                                  (str "(defn func-" i " [x] (+ x " i "))")))
+          fut (syntax/warm-buffer-cache-async! buffer)]
+      (when fut (.get ^java.util.concurrent.Future fut))
+      ;; Warm JIT
+      (dotimes [_ 20]
+        (syntax/get-autocomplete-candidates "func-" buffer 50))
+      ;; Benchmark 100 calls
+      (let [start (System/nanoTime)]
+        (dotimes [_ 100]
+          (syntax/get-autocomplete-candidates "func-" buffer 50))
+        (let [elapsed-ms (/ (- (System/nanoTime) start) 1000000.0)]
+          ;; Verify that 100 autocomplete invocations take far less than 100ms (< 1ms per call)
+          (is (< elapsed-ms 100.0) (str "Elapsed time was " elapsed-ms " ms for 100 calls")))))))
 
 
 

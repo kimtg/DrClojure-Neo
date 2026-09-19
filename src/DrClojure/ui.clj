@@ -19,7 +19,9 @@
                      KeyboardFocusManager Toolkit Desktop Desktop$Action GraphicsEnvironment)
            (java.net URI)
            (java.awt.event ActionEvent ActionListener KeyEvent KeyAdapter
-                           MouseAdapter MouseEvent WindowAdapter WindowEvent)))
+                           MouseAdapter MouseEvent WindowAdapter WindowEvent)
+           (java.util.concurrent Executors ThreadFactory ExecutorService)
+           (java.util.concurrent.atomic AtomicLong)))
 
 (def app-name "DrClojure")
 (def app-version "0.3.0")
@@ -821,6 +823,19 @@
      :find-next! find-next!
      :find-prev! find-prev!}))
 
+;; --- Autocomplete Background Worker & State ---
+
+(defonce ^ExecutorService autocomplete-executor
+  (Executors/newFixedThreadPool 2
+    (reify ThreadFactory
+      (newThread [_ r]
+        (doto (Thread. ^Runnable r "DrClojure-Autocomplete-Worker")
+          (.setDaemon true)
+          (.setPriority Thread/NORM_PRIORITY))))))
+
+(defonce autocomplete-request-seq (AtomicLong. 0))
+(defonce doc-preview-seq (AtomicLong. 0))
+
 ;; --- Autocomplete Popup & Controller ---
 
 (defn- create-autocomplete-renderer []
@@ -896,15 +911,44 @@
    (when doc-area
      (if candidate
        (let [sym (:symbol candidate)
-             extra-text (if (fn? extra-context) (extra-context) extra-context)
-             doc-info-primary (syntax/get-symbol-doc sym text caret)
-             doc-info (if (and (= (:status doc-info-primary) :not-found) (seq extra-text))
-                        (let [sec (syntax/get-symbol-doc sym extra-text 0)]
-                          (if (not= (:status sec) :not-found) sec doc-info-primary))
-                        doc-info-primary)
-             formatted (syntax/format-autocomplete-doc doc-info candidate)]
-         (.setText doc-area formatted)
-         (.setCaretPosition doc-area 0))
+             k (if (and text (not (str/blank? text)))
+                 [(str sym) (hash text) caret]
+                 (str sym))]
+         (if-let [hit (get @syntax/docstring-cache k)]
+           (let [formatted (syntax/format-autocomplete-doc hit candidate)]
+             (.setText doc-area formatted)
+             (.setCaretPosition doc-area 0))
+           (if-not (SwingUtilities/isEventDispatchThread)
+             ;; If off EDT (e.g. tests without event loop), compute synchronously
+             (let [extra-text (if (fn? extra-context) (extra-context) extra-context)
+                   doc-info-primary (syntax/get-cached-symbol-doc sym text caret)
+                   doc-info (if (and (= (:status doc-info-primary) :not-found) (seq extra-text))
+                              (let [sec (syntax/get-cached-symbol-doc sym extra-text 0)]
+                                (if (not= (:status sec) :not-found) sec doc-info-primary))
+                              doc-info-primary)
+                   formatted (syntax/format-autocomplete-doc doc-info candidate)]
+               (.setText doc-area formatted)
+               (.setCaretPosition doc-area 0))
+             ;; On EDT: fetch in background worker so EDT never blocks
+             (let [doc-id (.incrementAndGet doc-preview-seq)
+                   extra-text (if (fn? extra-context) (extra-context) extra-context)]
+               (.setText doc-area (str sym "\n\nLoading documentation..."))
+               (.setCaretPosition doc-area 0)
+               (try
+                 (.submit ^ExecutorService autocomplete-executor
+                   ^Runnable (fn []
+                               (let [doc-info-primary (syntax/get-cached-symbol-doc sym text caret)
+                                     doc-info (if (and (= (:status doc-info-primary) :not-found) (seq extra-text))
+                                                (let [sec (syntax/get-cached-symbol-doc sym extra-text 0)]
+                                                  (if (not= (:status sec) :not-found) sec doc-info-primary))
+                                                doc-info-primary)
+                                     formatted (syntax/format-autocomplete-doc doc-info candidate)]
+                                 (SwingUtilities/invokeLater
+                                   (fn []
+                                     (when (= doc-id (.get doc-preview-seq))
+                                       (.setText doc-area formatted)
+                                       (.setCaretPosition doc-area 0)))))))
+                 (catch Exception _ nil))))))
        (.setText doc-area "")))))
 
 (defn move-popup-selection!
@@ -927,30 +971,58 @@
             (update-doc-preview! doc-area sel txt c extra-context)))))))
 
 (defn update-autocomplete-filter!
-  "Dynamically updates candidates in the open popup as user continues typing or deletes."
-  [active-popup-atom]
-  (when-let [{:keys [popup list model doc-area start editor extra-context]} @active-popup-atom]
-    (when (.isVisible ^JPopupMenu popup)
-      (let [doc (.getDocument editor)
-            text (.getText doc 0 (.getLength doc))
-            caret (.getCaretPosition editor)]
-        (if (< caret start)
-          (dismiss-autocomplete! active-popup-atom)
-          (let [prefix-info (syntax/get-symbol-prefix-at-pos text caret)]
-            (if (or (not= (:start prefix-info) start)
-                    (and (empty? (:prefix prefix-info)) (< caret start)))
-              (dismiss-autocomplete! active-popup-atom)
-              (let [candidates (syntax/get-autocomplete-candidates (:prefix prefix-info) text caret extra-context)]
-                (if (empty? candidates)
-                  (dismiss-autocomplete! active-popup-atom)
-                  (do
-                    (.clear ^DefaultListModel model)
-                    (doseq [c candidates]
-                      (.addElement ^DefaultListModel model c))
-                    (.setSelectedIndex ^JList list 0)
-                    (.ensureIndexIsVisible ^JList list 0)
-                    (when doc-area
-                      (update-doc-preview! doc-area (first candidates) text caret extra-context))))))))))))
+  "Dynamically updates candidates in the open popup as user continues typing or deletes.
+   Runs candidate calculation in background thread to avoid blocking user code input."
+  ([active-popup-atom]
+   (update-autocomplete-filter! active-popup-atom nil))
+  ([active-popup-atom opts]
+   (when-let [{:keys [popup list model doc-area start editor extra-context]} @active-popup-atom]
+     (when (or (.isVisible ^JPopupMenu popup) (not (.isShowing editor)))
+       (let [doc (.getDocument editor)
+             text (.getText doc 0 (.getLength doc))
+             caret (.getCaretPosition editor)]
+         (if (< caret start)
+           (dismiss-autocomplete! active-popup-atom)
+           (let [prefix-info (syntax/get-symbol-prefix-at-pos text caret)]
+             (if (or (not= (:start prefix-info) start)
+                     (and (empty? (:prefix prefix-info)) (< caret start)))
+               (dismiss-autocomplete! active-popup-atom)
+               (let [prefix (:prefix prefix-info)
+                     sync? (and (map? opts) (:sync? opts))]
+                 (if sync?
+                   (let [candidates (syntax/get-autocomplete-candidates prefix text caret extra-context)]
+                     (if (empty? candidates)
+                       (dismiss-autocomplete! active-popup-atom)
+                       (do
+                         (doto ^DefaultListModel model
+                           (.clear)
+                           (.addAll ^java.util.Collection candidates))
+                         (.setSelectedIndex ^JList list 0)
+                         (.ensureIndexIsVisible ^JList list 0)
+                         (when doc-area
+                           (update-doc-preview! doc-area (first candidates) text caret extra-context)))))
+                   ;; Background worker execution: does not block EDT keystrokes
+                   (let [req-id (.incrementAndGet autocomplete-request-seq)]
+                     (try
+                       (.submit ^ExecutorService autocomplete-executor
+                         ^Runnable (fn []
+                                     (let [candidates (syntax/get-autocomplete-candidates prefix text caret extra-context)]
+                                       (SwingUtilities/invokeLater
+                                         (fn []
+                                           (when (= req-id (.get autocomplete-request-seq))
+                                             (when-let [{:keys [popup list model doc-area]} @active-popup-atom]
+                                               (when (or (.isVisible ^JPopupMenu popup) (not (.isShowing editor)))
+                                                 (if (empty? candidates)
+                                                   (dismiss-autocomplete! active-popup-atom)
+                                                   (do
+                                                     (doto ^DefaultListModel model
+                                                       (.clear)
+                                                       (.addAll ^java.util.Collection candidates))
+                                                     (.setSelectedIndex ^JList list 0)
+                                                     (.ensureIndexIsVisible ^JList list 0)
+                                                     (when doc-area
+                                                       (update-doc-preview! doc-area (first candidates) text caret extra-context))))))))))))
+                       (catch Exception _ nil)))))))))))))
 
 (defn show-autocomplete-popup!
   "Builds and displays a scrollable completion popup beneath or above the caret in `editor`.
@@ -964,9 +1036,12 @@
    (let [popup (JPopupMenu.)
          _ (.setBorder popup (BorderFactory/createLineBorder (Color. 180 180 180) 1))
          model (DefaultListModel.)
-         _ (doseq [c candidates] (.addElement model c))
+         _ (.addAll model ^java.util.Collection candidates)
          list (JList. model)
          _ (.setCellRenderer list (create-autocomplete-renderer))
+         _ (.setPrototypeCellValue list {:symbol "defprotocol" :category :special})
+         _ (.setFixedCellHeight list 20)
+         _ (.setFixedCellWidth list 210)
          _ (.setSelectionMode list ListSelectionModel/SINGLE_SELECTION)
          _ (.setSelectedIndex list 0)
          _ (.setFocusable list false)
@@ -1059,50 +1134,88 @@
        (catch Exception _ nil))
      (.requestFocusInWindow editor))))
 
+(defn- apply-autocomplete-results!
+  [^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom]
+  (cond
+    (empty? candidates)
+    (do
+      (dismiss-autocomplete! active-popup-atom)
+      (let [doc (.getDocument editor)
+            caret (.getCaretPosition editor)
+            prefix-info (syntax/get-symbol-prefix-at-pos (.getText doc 0 (.getLength doc)) caret)
+            pfx (:prefix prefix-info)]
+        (if (str/blank? pfx)
+          (when status-fn (status-fn "No completions available."))
+          (when status-fn (status-fn (format "No completions found for '%s'" pfx)))))
+      (try (.. Toolkit getDefaultToolkit beep) (catch Exception _ nil))
+      :no-match)
+
+    (= (count candidates) 1)
+    (let [sym (:symbol (first candidates))]
+      (dismiss-autocomplete! active-popup-atom)
+      (.setSelectionStart editor (int start))
+      (.setSelectionEnd editor (int word-end))
+      (.replaceSelection editor sym)
+      (.setCaretPosition editor (+ (int start) (count sym)))
+      (when update-dirty! (update-dirty!))
+      (when highlight-now! (highlight-now!))
+      (when status-fn (status-fn (str "Completed: " sym)))
+      :single-match)
+
+    :else
+    (do
+      (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom)
+      :multi-match)))
+
 (defn trigger-autocomplete!
   "Triggers autocomplete at the caret position in `editor`.
    - 0 matches: notifies status bar.
    - 1 match: immediately auto-completes and updates dirty state.
-   - >1 matches: shows popup list beneath/above caret."
+   - >1 matches: shows popup list beneath/above caret.
+   Runs candidate calculation in a background thread on the EDT to prevent blocking user code input."
   ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty!]
-   (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! nil nil))
+   (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! nil nil nil))
   ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty! extra-context]
-   (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! extra-context nil))
+   (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! extra-context nil nil))
   ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom]
-   (let [doc (.getDocument editor)
+   (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom nil))
+  ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom opts]
+   (let [async? (if (and (map? opts) (contains? opts :async?))
+                  (:async? opts)
+                  (SwingUtilities/isEventDispatchThread))
+         doc (.getDocument editor)
          text (.getText doc 0 (.getLength doc))
          caret (.getCaretPosition editor)
          prefix-info (syntax/get-symbol-prefix-at-pos text caret)
          prefix (:prefix prefix-info)
          start (:start prefix-info)
-         word-end (:word-end prefix-info)
-         candidates (syntax/get-autocomplete-candidates prefix text caret extra-context)]
-     (cond
-       (empty? candidates)
-       (do
-         (dismiss-autocomplete! active-popup-atom)
-         (if (str/blank? prefix)
-           (status-fn "No completions available.")
-           (status-fn (format "No completions found for '%s'" prefix)))
-         (try (.. Toolkit getDefaultToolkit beep) (catch Exception _ nil))
-         :no-match)
-
-       (= (count candidates) 1)
-       (let [sym (:symbol (first candidates))]
-         (dismiss-autocomplete! active-popup-atom)
-         (.setSelectionStart editor (int start))
-         (.setSelectionEnd editor (int word-end))
-         (.replaceSelection editor sym)
-         (.setCaretPosition editor (+ (int start) (count sym)))
-         (when update-dirty! (update-dirty!))
-         (when highlight-now! (highlight-now!))
-         (status-fn (str "Completed: " sym))
-         :single-match)
-
-       :else
-       (do
-         (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom)
-         :multi-match)))))
+         word-end (:word-end prefix-info)]
+     (if-not async?
+       (let [candidates (syntax/get-autocomplete-candidates prefix text caret extra-context)]
+         (apply-autocomplete-results! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom))
+       ;; Asynchronous execution on background worker: never blocks the EDT
+       (let [req-id (.incrementAndGet autocomplete-request-seq)]
+         (.submit ^ExecutorService autocomplete-executor
+           ^Runnable (fn []
+                       (let [candidates (syntax/get-autocomplete-candidates prefix text caret extra-context)]
+                         (SwingUtilities/invokeLater
+                           (fn []
+                             (when (= req-id (.get autocomplete-request-seq))
+                               (let [cur-doc (.getDocument editor)
+                                     cur-txt (.getText cur-doc 0 (.getLength cur-doc))
+                                     cur-caret (.getCaretPosition editor)]
+                                 (if (and (= cur-txt text) (= cur-caret caret))
+                                   (apply-autocomplete-results! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom)
+                                   ;; User typed more characters while background query was resolving
+                                   (let [cur-prefix-info (syntax/get-symbol-prefix-at-pos cur-txt cur-caret)
+                                         cur-prefix (:prefix cur-prefix-info)
+                                         cur-start (:start cur-prefix-info)]
+                                     (when (and (= cur-start start) (>= cur-caret start) (str/starts-with? cur-prefix prefix))
+                                       (let [filtered (vec (filter (fn [{:keys [symbol]}]
+                                                                     (str/starts-with? (str/lower-case symbol) (str/lower-case cur-prefix)))
+                                                                   candidates))]
+                                         (when (pos? (count filtered))
+                                           (show-autocomplete-popup! editor filtered start (:word-end cur-prefix-info) status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom))))))))))))))))))
 
 (defn setup-autocomplete-keys!
   "Installs key and focus listeners on `editor` to control autocomplete popup navigation and commits."
@@ -1380,6 +1493,8 @@
   (let [init-content (if (and (not (str/blank? initial-file)) (.exists (java.io.File. initial-file)))
                        (try (slurp initial-file) (catch Exception _ ""))
                        "")
+        _ (when (seq init-content)
+            (syntax/warm-buffer-cache-async! init-content))
         frame (proxy [JFrame] [(str "Untitled - " app-name)]
                 (dispose []
                   (swap! active-windows dissoc this)

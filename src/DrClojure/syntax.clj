@@ -8,7 +8,8 @@
            (javax.swing.event DocumentListener)
            (java.awt Color)
            (java.awt.event ActionListener)
-           (java.util.regex Pattern Matcher)))
+           (java.util.regex Pattern Matcher)
+           (java.util.concurrent Executors ThreadFactory ExecutorService)))
 
 ;; --- Token Definitions ---
 
@@ -231,9 +232,12 @@
              (.setCharacterAttributes doc (int start) (int (- end start)) attr true)))
          binfo)))))
 
+(declare warm-buffer-cache-async!)
+
 (defn setup-syntax-highlighting!
   "Attaches a live syntax highlighting listener to `pane`.
    Uses a debounced Swing Timer so that rapid typing remains smooth and responsive.
+   Also triggers background caching of document symbols for instant autocomplete.
    Returns a map with:
    - `:timer` (javax.swing.Timer)
    - `:bracket-info` (atom holding latest bracket info)
@@ -243,7 +247,11 @@
         binfo-atom (atom {:bracket-tokens [] :matches {} :unmatched #{}})
         highlight-fn (fn []
                        (let [info (highlight-doc! doc palette)]
-                         (reset! binfo-atom info)))
+                         (reset! binfo-atom info)
+                         (try
+                           (let [txt (.getText doc 0 (.getLength doc))]
+                             (warm-buffer-cache-async! txt))
+                           (catch Exception _ nil))))
         timer (Timer. (int delay-ms)
                 (proxy [ActionListener] []
                   (actionPerformed [e]
@@ -666,7 +674,42 @@
         (conj! parts "(No documentation string)"))
       (apply str (persistent! parts)))))
 
-;; --- Autocomplete Candidate & Prefix Extraction ---
+;; --- Background Worker & Autocomplete Candidate Caching ---
+
+(defonce ^ExecutorService cache-executor
+  (Executors/newSingleThreadExecutor
+    (reify ThreadFactory
+      (newThread [_ r]
+        (doto (Thread. ^Runnable r "DrClojure-Autocomplete-Cache-Worker")
+          (.setDaemon true)
+          (.setPriority Thread/MIN_PRIORITY))))))
+
+(defn- prune-cache [m max-size]
+  (if (<= (count m) max-size)
+    m
+    (let [sorted-entries (sort-by (fn [[_ v]] (or (:timestamp v) 0)) m)
+          to-remove (take (- (count m) max-size) sorted-entries)]
+      (apply dissoc m (map first to-remove)))))
+
+(defonce buffer-symbols-cache (atom {}))
+(defonce docstring-cache (atom {}))
+
+(defn get-cached-symbol-doc
+  "Retrieves doc information map for `sym-name`, with bounded caching.
+   Caches runtime/special-form doc lookups and buffer lookups."
+  ([sym-name]
+   (get-cached-symbol-doc sym-name nil nil))
+  ([sym-name ^String text]
+   (get-cached-symbol-doc sym-name text nil))
+  ([sym-name ^String text pos]
+   (let [k (if (and text (not (str/blank? text)))
+             [(str sym-name) (hash text) pos]
+             (str sym-name))]
+     (if-let [hit (get @docstring-cache k)]
+       hit
+       (let [res (get-symbol-doc sym-name text pos)]
+         (swap! docstring-cache (fn [m] (prune-cache (assoc m k res) 512)))
+         res)))))
 
 (def all-core-builtins
   "Cached set of all clojure.core public var names combined with syntax core-builtins."
@@ -676,39 +719,140 @@
                     (catch Exception _ #{}))]
       (into core-builtins publics))))
 
-(defn find-buffer-definitions
-  "Extracts all symbols defined in `text` via top-level definition forms
-   (defn, def, defmacro, defmulti, defmethod, defonce, defprotocol, defrecord, deftype, etc.).
-   Returns a set of symbol names as strings."
+(def static-candidates
+  "Precomputes all static candidate maps for special forms and clojure.core builtins,
+   deduplicated with priority :special > :builtin, and bucketed by lowercase initial character."
+  (delay
+    (let [specials (map (fn [s] {:symbol s :category :special}) special-forms)
+          builtins (map (fn [s] {:symbol s :category :builtin}) @all-core-builtins)
+          deduped (reduce (fn [m c]
+                            (let [sym (:symbol c)]
+                              (if (contains? m sym) m (assoc m sym c))))
+                          {}
+                          (concat specials builtins))
+          all-vec (vec (sort-by (fn [{:keys [symbol category]}]
+                                  [(case category :special 0 :builtin 1 2)
+                                   (str/lower-case symbol)
+                                   symbol])
+                                (vals deduped)))
+          by-char (group-by (fn [{:keys [symbol]}]
+                              (if (pos? (count symbol))
+                                (Character/toLowerCase ^Character (.charAt ^String symbol 0))
+                                nil))
+                            all-vec)]
+      {:all all-vec
+       :by-char by-char})))
+
+;; Pre-warm static candidates in background worker upon loading
+(try
+  (.submit ^ExecutorService cache-executor ^Runnable (fn [] @static-candidates))
+  (catch Exception _ nil))
+
+(defn- find-span-at-pos
+  "Binary search for span [sym start end] containing `pos` (start <= pos <= end).
+   Returns the symbol string, or nil if none."
+  [^clojure.lang.PersistentVector spans ^long pos]
+  (let [n (count spans)]
+    (loop [low 0
+           high (dec n)]
+      (when (<= low high)
+        (let [mid (quot (+ low high) 2)
+              [sym s e] (nth spans mid)]
+          (cond
+            (< pos (long s)) (recur low (dec mid))
+            (> pos (long e)) (recur (inc mid) high)
+            :else sym))))))
+
+(defn extract-text-symbols
+  "Parses `text` in a single pass over non-comment tokens to extract:
+   - `:defs`: set of symbols defined via top-level `def-forms`
+   - `:spans`: vector of [sym-str start end] for all symbol tokens
+   - `:all-tokens`: set of all symbol strings across the text
+   - `:token-counts`: map of symbol to frequency in text"
   [^String text]
   (if (or (nil? text) (str/blank? text))
-    #{}
-    (let [tokens (vec (filter #(not= (first %) :comment) (tokenize text)))
+    {:defs #{} :spans [] :all-tokens #{} :token-counts {}}
+    (let [raw-tokens (tokenize text)
+          tokens (filterv #(not= (first %) :comment) raw-tokens)
           n (count tokens)]
       (loop [i 0
-             acc #{}]
+             defs (transient #{})
+             spans (transient [])
+             all-tokens (transient #{})
+             token-counts (transient {})]
         (if (< i n)
-          (let [[tok-type s _] (nth tokens i)]
-            (if (and (= tok-type :bracket) (= (.charAt text s) \())
-              (if (< (inc i) n)
-                (let [[next-type next-s next-e] (nth tokens (inc i))
+          (let [[tok-type s e] (nth tokens i)]
+            (cond
+              (= tok-type :bracket)
+              (if (and (= (.charAt text s) \() (< (inc i) n))
+                (let [[_ next-s next-e] (nth tokens (inc i))
                       sym-form (.substring text next-s next-e)]
                   (if (def-forms sym-form)
-                    ;; Scan forward past metadata to find defined symbol
                     (let [found (loop [j (+ i 2)]
                                   (when (< j n)
                                     (let [[t-type ts te] (nth tokens j)]
                                       (cond
                                         (= t-type :metatag) (recur (inc j))
-                                        (= t-type :symbol) (.substring text ts te)
+                                        (#{:symbol :special-form :builtin :constant} t-type) (.substring text ts te)
                                         :else nil))))]
-                      (if found
-                        (recur (inc i) (conj acc found))
-                        (recur (inc i) acc)))
-                    (recur (inc i) acc)))
-                (recur (inc i) acc))
-              (recur (inc i) acc)))
-          acc)))))
+                      (recur (inc i)
+                             (if found (conj! defs found) defs)
+                             spans
+                             all-tokens
+                             token-counts))
+                    (recur (inc i) defs spans all-tokens token-counts)))
+                (recur (inc i) defs spans all-tokens token-counts))
+
+              (= tok-type :symbol)
+              (let [sym-str (.substring text s e)
+                    cur-cnt (get token-counts sym-str 0)]
+                (recur (inc i)
+                       defs
+                       (conj! spans [sym-str s e])
+                       (conj! all-tokens sym-str)
+                       (assoc! token-counts sym-str (inc cur-cnt))))
+
+              :else
+              (recur (inc i) defs spans all-tokens token-counts)))
+          {:defs (persistent! defs)
+           :spans (persistent! spans)
+           :all-tokens (persistent! all-tokens)
+           :token-counts (persistent! token-counts)})))))
+
+(defn get-cached-or-compute-buffer-symbols
+  "Returns `{:defs #{...} :spans [...] :all-tokens #{...}}` for `text`.
+   Checks `buffer-symbols-cache` first (O(1)). If missing, computes synchronously,
+   stores into cache, and returns it."
+  [^String text]
+  (if (or (nil? text) (str/blank? text))
+    {:defs #{} :spans [] :all-tokens #{} :token-counts {}}
+    (let [h (hash text)
+          now (System/currentTimeMillis)]
+      (if-let [entry (get @buffer-symbols-cache h)]
+        entry
+        (let [computed (assoc (extract-text-symbols text) :timestamp now)]
+          (swap! buffer-symbols-cache (fn [m] (prune-cache (assoc m h computed) 32)))
+          computed)))))
+
+(defn warm-buffer-cache-async!
+  "Asynchronously computes and caches symbols for `text` in `cache-executor` background thread.
+   Returns a java.util.concurrent.Future (or nil if text is empty or already cached)."
+  [^String text]
+  (when (and (string? text) (not (str/blank? text)))
+    (let [h (hash text)]
+      (when-not (contains? @buffer-symbols-cache h)
+        (try
+          (.submit ^ExecutorService cache-executor
+            ^Runnable (fn []
+                        (get-cached-or-compute-buffer-symbols text)))
+          (catch Exception _ nil))))))
+
+(defn find-buffer-definitions
+  "Extracts all symbols defined in `text` via top-level definition forms
+   (defn, def, defmacro, defmulti, defmethod, defonce, defprotocol, defrecord, deftype, etc.).
+   Returns a set of symbol names as strings."
+  [^String text]
+  (:defs (get-cached-or-compute-buffer-symbols text)))
 
 (defn symbol-char?
   "Returns true if `ch` is a valid character inside a Clojure symbol/identifier."
@@ -761,66 +905,93 @@
          prefix (or prefix "")
          prefix-lower (str/lower-case prefix)
          pos-int (when (number? pos) (int pos))
-         user-defs-text (if text (find-buffer-definitions text) #{})
-         user-defs-extra (if (and (string? extra-text) (not (str/blank? extra-text)))
-                           (find-buffer-definitions extra-text)
-                           #{})
-         user-defs (into (set user-defs-text) user-defs-extra)
-         tokens-text (if text
-                       (keep (fn [[tok-type s e]]
-                               (when (and (= tok-type :symbol)
-                                          (not (and pos-int (<= s pos-int e)))
-                                          (not= (.substring text s e) prefix))
-                                 (.substring text s e)))
-                             (tokenize text))
-                       [])
-         tokens-extra (if (and (string? extra-text) (not (str/blank? extra-text)))
-                        (keep (fn [[tok-type s e]]
-                                (when (and (= tok-type :symbol)
-                                           (not= (.substring extra-text s e) prefix))
-                                  (.substring extra-text s e)))
-                              (tokenize extra-text))
-                        [])
-         user-doc-syms (into (set tokens-text) tokens-extra)
+         has-prefix? (not (str/blank? prefix))
+
+         ;; Buffer and extra context symbol resolution via background/LRU cache
+         text-data (when (and text (not (str/blank? text)))
+                     (get-cached-or-compute-buffer-symbols text))
+         extra-data (when (and (string? extra-text) (not (str/blank? extra-text)))
+                      (get-cached-or-compute-buffer-symbols extra-text))
+
+         ;; User definitions
+         user-defs (into (set (or (:defs text-data) #{}))
+                         (or (:defs extra-data) #{}))
+
+         ;; Document tokens (excluding active word at pos and prefix itself)
+         tokens-text (if text-data
+                       (let [all-tokens (:all-tokens text-data)]
+                         (if (and pos-int (seq (:spans text-data)))
+                           (if-let [sym-at-pos (find-span-at-pos (:spans text-data) (long pos-int))]
+                             (if (<= (get (:token-counts text-data) sym-at-pos 1) 1)
+                               (disj all-tokens sym-at-pos prefix)
+                               (disj all-tokens prefix))
+                             (disj all-tokens prefix))
+                           (disj all-tokens prefix)))
+                       #{})
+         tokens-extra (if extra-data
+                        (disj (or (:all-tokens extra-data) #{}) prefix)
+                        #{})
+         user-doc-syms (into tokens-text tokens-extra)
+
+         ;; Runtime namespace definitions
          runtime-user (try
                         (let [curr-ns (or *ns* (find-ns 'user))]
                           (if curr-ns
                             (set (map name (keys (ns-publics curr-ns))))
                             #{}))
                         (catch Exception _ #{}))
-         all-builtins @all-core-builtins
-         ;; Group user symbols (excluding known special-forms and builtins)
+
+         ;; Combine user symbols
+         all-core @all-core-builtins
          all-user (into (into (set user-defs) runtime-user)
                         (remove #(or (contains? special-forms %)
-                                     (contains? all-builtins %))
+                                     (contains? all-core %))
                                 user-doc-syms))
-         ;; Candidate maps
-         special-maps (map (fn [s] {:symbol s :category :special}) special-forms)
-         builtin-maps (map (fn [s] {:symbol s :category :builtin}) all-builtins)
-         user-maps (map (fn [s] {:symbol s :category :user}) all-user)
-         ;; Deduplicate by symbol name, with priority :user > :special > :builtin
-         by-sym (reduce (fn [m c]
-                          (let [sym (:symbol c)
-                                prev (get m sym)]
-                            (cond
-                              (nil? prev) (assoc m sym c)
-                              (= (:category c) :user) (assoc m sym c)
-                              :else m)))
-                        {}
-                        (concat user-maps special-maps builtin-maps))
-         ;; Filter candidates matching prefix (case-insensitive starts-with)
-         matched (filter (fn [{:keys [symbol]}]
-                           (if (str/blank? prefix)
-                             true
-                             (str/starts-with? (str/lower-case symbol) prefix-lower)))
-                         (vals by-sym))]
-     (vec
-       (sort-by (fn [{:keys [symbol category]}]
-                  [(if (str/starts-with? symbol prefix) 0 1)
-                   (case category :user 0 :special 1 :builtin 2 3)
-                   (str/lower-case symbol)
-                   symbol])
-                matched)))))
+
+         ;; Filter user candidates by prefix
+         matching-user (reduce (fn [acc sym]
+                                 (if (or (not has-prefix?)
+                                         (str/starts-with? (str/lower-case sym) prefix-lower))
+                                   (conj! acc {:symbol sym :category :user})
+                                   acc))
+                               (transient [])
+                               all-user)
+         matching-user-vec (persistent! matching-user)
+         user-syms-set (set (map :symbol matching-user-vec))
+
+         ;; Static candidate lookup via initial-char bucket
+         static-pool (if has-prefix?
+                       (let [first-ch (Character/toLowerCase ^Character (.charAt prefix 0))]
+                         (get (:by-char @static-candidates) first-ch []))
+                       (:all @static-candidates))
+
+         ;; Filter static candidates by prefix and exclude any symbol overridden by user
+         matching-static (reduce (fn [acc {:keys [symbol] :as cand}]
+                                   (if (and (or (not has-prefix?)
+                                                (str/starts-with? (str/lower-case symbol) prefix-lower))
+                                            (not (contains? user-syms-set symbol)))
+                                     (conj! acc cand)
+                                     acc))
+                                 (transient [])
+                                 static-pool)
+         combined (concat matching-user-vec (persistent! matching-static))]
+
+     (if (not has-prefix?)
+       (if (empty? matching-user-vec)
+         (:all @static-candidates)
+         (let [sorted-user (vec (sort-by (fn [{:keys [symbol]}]
+                                           [(str/lower-case symbol) symbol])
+                                         matching-user-vec))]
+           (into sorted-user
+                 (remove #(contains? user-syms-set (:symbol %))
+                         (:all @static-candidates)))))
+       (vec
+         (sort-by (fn [{:keys [symbol category]}]
+                    [(if (str/starts-with? symbol prefix) 0 1)
+                     (case category :user 0 :special 1 :builtin 2 3)
+                     (str/lower-case symbol)
+                     symbol])
+                  combined))))))
 
 ;; --- Clojure Code Formatter ---
 

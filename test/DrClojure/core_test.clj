@@ -1,9 +1,10 @@
 (ns DrClojure.core-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
   (:import (java.awt.event KeyEvent)
-           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList JTextArea JTextField JComponent JLabel)
+           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList JTextArea JTextField JComponent JLabel SwingUtilities DefaultListModel)
            (javax.swing.text DefaultStyledDocument)))
 
 (deftest app-metadata-test
@@ -880,3 +881,75 @@
         (is (.isConsumed esc-event))
         (is (nil? @popup-atom))
         (is (= "(pri" (.getText input)))))))
+
+(deftest autocomplete-background-nonblocking-test
+  (testing "trigger-autocomplete! with {:async? true} returns Future without blocking thread"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          code "(pri"]
+      (.setText editor code)
+      (.setCaretPosition editor 4)
+      (let [fut (ui/trigger-autocomplete! editor status-fn popup-atom nil nil nil nil {:async? true})]
+        (is (instance? java.util.concurrent.Future fut))
+        ;; Await completion
+        (.get ^java.util.concurrent.Future fut)
+        (SwingUtilities/invokeAndWait (fn [] nil))
+        (is (some? @popup-atom))
+        (ui/dismiss-autocomplete! popup-atom))))
+
+  (testing "update-autocomplete-filter! dynamically narrows candidates in background"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-fn (fn [_] nil)]
+      (.setText editor "(pri")
+      (.setCaretPosition editor 4)
+      (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)
+      (is (some? @popup-atom))
+      (let [initial-count (.getSize ^DefaultListModel (:model @popup-atom))]
+        (is (> initial-count 1))
+        ;; User types "n" -> "(prin"
+        (.setText editor "(prin")
+        (.setCaretPosition editor 5)
+        (ui/update-autocomplete-filter! popup-atom {:sync? true})
+        (let [filtered-count (.getSize ^DefaultListModel (:model @popup-atom))]
+          (is (<= filtered-count initial-count))
+          (is (every? #(str/starts-with? (str/lower-case (:symbol %)) "prin")
+                      (for [i (range filtered-count)]
+                        (.getElementAt ^DefaultListModel (:model @popup-atom) i)))))
+        (ui/dismiss-autocomplete! popup-atom)))
+
+  (testing "trigger-autocomplete! with blank prefix displays popup with fixed cell dimensions"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))]
+      ;; Cursor is at position 0 (empty editor, blank prefix)
+      (.setText editor "")
+      (.setCaretPosition editor 0)
+      (let [res (ui/trigger-autocomplete! editor status-fn popup-atom nil nil nil nil {:async? false})]
+        (is (= :multi-match res))
+        (is (some? @popup-atom))
+        (let [{:keys [list model]} @popup-atom]
+          (is (> (.getSize ^DefaultListModel model) 600))
+          (is (= 20 (.getFixedCellHeight ^JList list)))
+          (is (= 210 (.getFixedCellWidth ^JList list)))
+          (is (some? (.getPrototypeCellValue ^JList list))))
+        (ui/dismiss-autocomplete! popup-atom))))
+
+  (testing "update-autocomplete-filter! with blank prefix repopulates full list smoothly"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-fn (fn [_] nil)]
+      (.setText editor "a")
+      (.setCaretPosition editor 1)
+      (ui/trigger-autocomplete! editor status-fn popup-atom nil nil nil nil {:async? false})
+      (is (some? @popup-atom))
+      ;; User deletes "a", leaving prefix blank
+      (.setText editor "")
+      (.setCaretPosition editor 0)
+      (ui/update-autocomplete-filter! popup-atom {:sync? true})
+      (let [{:keys [model]} @popup-atom]
+        (is (> (.getSize ^DefaultListModel model) 600)))
+      (ui/dismiss-autocomplete! popup-atom)))))
