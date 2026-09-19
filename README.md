@@ -22,6 +22,7 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 - **Rename (Refactor) Symbol**: Press `Shift+F6` or `F2` to safely rename all occurrences of a symbol across the file (with lexical filtering preventing unintended replacements in comments or strings).
 - **Jump to Definition**: Press `F12` or `Ctrl+B` to instantly jump to top-level definitions (`defn`, `def`, `defmacro`, etc.) or local bindings, scroll into view, or inspect external Clojure Var definitions.
 - **Editor Context Menu**: Right-click anywhere in the editor for quick access to Jump to Definition, Rename Symbol, Quick Documentation, Toggle Comment, Indent, Unindent, Find, Replace, Cut, Copy, and Paste.
+- **Multi-Window Editing (`File -> New`)**: Press `Ctrl+N` to spawn independent DrClojure IDE windows with isolated file buffers, REPL evaluation contexts, and undo stacks for multi-file workflows. Closing a single window via `Ctrl+W` or the title bar keeps other windows active, exiting cleanly only when the last window is closed.
 - **Clojure Syntax Highlighting**: Real-time syntax coloring for special forms, built-ins, constants, keywords, strings, characters, numbers, and comments.
 - **Undo / Redo with Dirty Tracking**: Standard `Ctrl+Z` / `Ctrl+Y` support with clean undo isolation and accurate `*` unsaved changes tracking that automatically restores clean state on undo.
 - **Flexible Editor Width**: Code editor dynamically fills the window width while enabling horizontal scrollbars only when lines exceed the pane width.
@@ -115,7 +116,9 @@ clj -M:test
 | `Ctrl + S` | Save file |
 | `Ctrl + Shift + S` | Save As... |
 | `Ctrl + O` | Open file |
-| `Ctrl + N` | New file |
+| `Ctrl + N` | New Window (Multi-file editing) |
+| `Ctrl + W` | Close Window |
+| `Ctrl + Q` | Exit DrClojure / Close all windows |
 | `Ctrl + Z` | Undo |
 | `Ctrl + Y` / `Ctrl + Shift + Z` | Redo |
 | `Tab` | Insert 2 spaces / indent selection |

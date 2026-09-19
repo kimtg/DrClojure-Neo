@@ -3,7 +3,7 @@
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
   (:import (java.awt.event KeyEvent)
-           (javax.swing JDialog JFrame JTextPane KeyStroke)
+           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke)
            (javax.swing.text DefaultStyledDocument)))
 
 (deftest app-metadata-test
@@ -354,3 +354,116 @@
         (when (instance? JDialog w)
           (.dispose w)))
       (.dispose frame))))
+
+(deftest file-menu-items-test
+  (testing "File menu contains New, Open, Save, Save As, Close Window, and Exit actions"
+    (let [frame (ui/create-ide nil)
+          menubar (.getJMenuBar frame)
+          file-menu (.getMenu menubar 0) ;; 0 = File
+          item-count (.getItemCount file-menu)
+          items (set (keep (fn [i] (when-let [item (.getItem file-menu i)] (.getText item)))
+                           (range item-count)))]
+      (is (contains? items "New"))
+      (is (contains? items "Open..."))
+      (is (contains? items "Save"))
+      (is (contains? items "Save As..."))
+      (is (contains? items "Close Window"))
+      (is (contains? items "Exit"))
+      (.dispose frame))))
+
+(deftest multi-window-creation-test
+  (testing "File -> New spawns a separate independent window and registers in active-windows"
+    (let [frame1 (ui/create-ide nil)
+          f1-info (get @ui/active-windows frame1)
+          file-new-fn (:file-new-fn f1-info)]
+      (is (some? f1-info))
+      (is (fn? file-new-fn))
+      ;; Trigger File -> New to spawn a second window
+      (let [frame2 (file-new-fn)
+            f2-info (get @ui/active-windows frame2)]
+        (is (instance? JFrame frame2))
+        (is (not= frame1 frame2))
+        (is (some? f2-info))
+        (is (contains? @ui/active-windows frame1))
+        (is (contains? @ui/active-windows frame2))
+        (is (= 2 (count @ui/active-windows)))
+        ;; Verify independent title and dirty state
+        (is (not (.startsWith (.getTitle frame1) "*")))
+        (is (not (.startsWith (.getTitle frame2) "*")))
+        ;; Disposing frames unregisters them from active-windows
+        (.dispose frame2)
+        (is (not (contains? @ui/active-windows frame2)))
+        (.dispose frame1)
+        (is (not (contains? @ui/active-windows frame1)))))))
+
+(deftest multi-window-close-test
+  (testing "Closing one window does not trigger exit-handler when other windows remain open"
+    (let [orig-handler @ui/exit-handler
+          exit-called? (atom false)
+          _ (reset! ui/exit-handler (fn [] (reset! exit-called? true)))
+          frame1 (ui/create-ide nil)
+          frame2 (ui/open-ide-window! nil frame1)
+          close-fn1 (:close-fn (get @ui/active-windows frame1))
+          close-fn2 (:close-fn (get @ui/active-windows frame2))]
+      (try
+        (is (contains? @ui/active-windows frame1))
+        (is (contains? @ui/active-windows frame2))
+        ;; Close frame1
+        (close-fn1)
+        ;; frame1 should be removed, frame2 should still exist
+        (is (not (contains? @ui/active-windows frame1)))
+        (is (contains? @ui/active-windows frame2))
+        ;; exit-handler should NOT have been called yet
+        (is (false? @exit-called?))
+
+        ;; Now close frame2 (the last remaining window)
+        (close-fn2)
+        (is (not (contains? @ui/active-windows frame2)))
+        ;; Now exit-handler SHOULD have been called
+        (is (true? @exit-called?))
+        (finally
+          (reset! ui/exit-handler orig-handler)
+          (.dispose frame1)
+          (.dispose frame2))))))
+
+(deftest multi-window-independent-state-test
+  (testing "Each window maintains its own independent state atoms and title"
+    (let [frame1 (ui/open-ide-window! "deps.edn")
+          frame2 (ui/open-ide-window! nil frame1)
+          info1 (get @ui/active-windows frame1)
+          info2 (get @ui/active-windows frame2)]
+      (try
+        (is (some? info1))
+        (is (some? info2))
+        (is (= "deps.edn" @(:cur-file-atom info1)))
+        (is (= "" @(:cur-file-atom info2)))
+        (is (false? @(:dirty?-atom info1)))
+        (is (false? @(:dirty?-atom info2)))
+        (is (.contains (.getTitle frame1) "deps.edn"))
+        (is (.contains (.getTitle frame2) "Untitled"))
+        (finally
+          (.dispose frame1)
+          (.dispose frame2))))))
+
+(deftest multi-window-exit-all-test
+  (testing "File -> Exit safely disposes all open windows and calls exit-handler"
+    (let [orig-handler @ui/exit-handler
+          exit-called? (atom false)
+          _ (reset! ui/exit-handler (fn [] (reset! exit-called? true)))
+          frame1 (ui/open-ide-window! nil)
+          frame2 (ui/open-ide-window! nil frame1)
+          menubar (.getJMenuBar frame1)
+          file-menu (.getMenu menubar 0)
+          exit-item (.getItem file-menu 6)] ;; index 6 is Exit (after separator)
+      (try
+        (is (= "Exit" (.getText exit-item)))
+        (is (= 2 (count @ui/active-windows)))
+        ;; Trigger Exit menu item
+        (.doClick exit-item)
+        ;; Both windows should be closed and removed from active-windows
+        (is (= 0 (count @ui/active-windows)))
+        (is (true? @exit-called?))
+        (finally
+          (reset! ui/exit-handler orig-handler)
+          (.dispose frame1)
+          (.dispose frame2))))))

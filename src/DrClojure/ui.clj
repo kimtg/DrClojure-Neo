@@ -15,7 +15,7 @@
            (javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent
                              DefaultStyledDocument AbstractDocument$DefaultDocumentEvent)
            (java.awt BorderLayout FlowLayout GridLayout Dimension Font Color Insets
-                     KeyboardFocusManager Toolkit Desktop Desktop$Action)
+                     KeyboardFocusManager Toolkit Desktop Desktop$Action GraphicsEnvironment)
            (java.net URI)
            (java.awt.event ActionEvent ActionListener KeyEvent KeyAdapter
                            MouseAdapter MouseEvent WindowAdapter WindowEvent)))
@@ -912,13 +912,35 @@
     (.setLocationRelativeTo dialog parent-frame)
     (.setVisible dialog true)))
 
+;; --- Multi-Window Management ---
+
+(def active-windows
+  "Tracks all active DrClojure IDE frames mapped to their window context handlers:
+   {frame {:frame frame
+           :prompt-save-fn (fn [] ...)
+           :close-fn (fn [] ...)
+           :file-new-fn (fn [] ...)
+           :cur-file-atom cur-file
+           :dirty?-atom dirty?}}"
+  (atom {}))
+
+(def exit-handler
+  "Function invoked when all windows are closed or application exits.
+   Defaults to (System/exit 0)."
+  (atom (fn [] (System/exit 0))))
+
+(declare open-ide-window!)
+
 ;; --- Main UI Builder ---
 
 (defn create-ide [initial-file]
   (let [init-content (if (and (not (str/blank? initial-file)) (.exists (java.io.File. initial-file)))
                        (try (slurp initial-file) (catch Exception _ ""))
                        "")
-        frame (JFrame. (str "Untitled - " app-name))
+        frame (proxy [JFrame] [(str "Untitled - " app-name)]
+                (dispose []
+                  (swap! active-windows dissoc this)
+                  (proxy-super dispose)))
         eval-ctx (eval/make-eval-context)
         cur-file (atom (or initial-file ""))
         saved-content (atom init-content)
@@ -1315,13 +1337,33 @@
                           :proceed))
 
                       (file-new! []
-                        (when (= (prompt-save-if-dirty!) :proceed)
-                          (reset! cur-file "")
-                          (reset! saved-content "")
-                          (reset! dirty? false)
-                          (.setText editor "")
-                          (highlight-now!)
-                          (update-title!)))
+                        (open-ide-window! nil frame))
+
+                      (close-window! []
+                        (if (= (prompt-save-if-dirty!) :proceed)
+                          (do
+                            (swap! active-windows dissoc frame)
+                            (.dispose frame)
+                            (when (empty? @active-windows)
+                              (@exit-handler))
+                            :proceed)
+                          :cancel))
+
+                      (exit-application! []
+                        (let [windows (vals @active-windows)
+                              can-exit? (loop [ws windows]
+                                          (if (empty? ws)
+                                            true
+                                            (let [{:keys [prompt-save-fn]} (first ws)]
+                                              (if (= (prompt-save-fn) :proceed)
+                                                (recur (rest ws))
+                                                false))))]
+                          (when can-exit?
+                            (doseq [{:keys [^JFrame frame]} (vals @active-windows)]
+                              (try (.dispose frame) (catch Throwable _ nil)))
+                            (reset! active-windows {})
+                            (@exit-handler)
+                            :proceed)))
 
                       (file-open! []
                         (when (= (prompt-save-if-dirty!) :proceed)
@@ -1340,12 +1382,16 @@
                                 (catch Exception ex
                                   (JOptionPane/showMessageDialog frame
                                     (str "Failed to open file:\n" (.getMessage ex))
-                                    "Error" JOptionPane/ERROR_MESSAGE)))))))
+                                    "Error" JOptionPane/ERROR_MESSAGE)))))))]
 
-                      (file-exit! []
-                        (when (= (prompt-save-if-dirty!) :proceed)
-                          (.dispose frame)
-                          (System/exit 0)))]
+                ;; Register window in active-windows map
+                (swap! active-windows assoc frame
+                  {:frame frame
+                   :prompt-save-fn prompt-save-if-dirty!
+                   :close-fn close-window!
+                   :file-new-fn file-new!
+                   :cur-file-atom cur-file
+                   :dirty?-atom dirty?})
 
                 ;; Highlight initial file if loaded
                 (when-not (empty? init-content)
@@ -1363,21 +1409,26 @@
                       item-open (JMenuItem. "Open..." (int \O))
                       item-save (JMenuItem. "Save" (int \S))
                       item-save-as (JMenuItem. "Save As..." (int \A))
+                      item-close (JMenuItem. "Close Window" (int \W))
                       item-exit (JMenuItem. "Exit" (int \X))
                       _ (do (.setAccelerator item-new (KeyStroke/getKeyStroke "control N"))
                             (.setAccelerator item-open (KeyStroke/getKeyStroke "control O"))
                             (.setAccelerator item-save (KeyStroke/getKeyStroke "control S"))
                             (.setAccelerator item-save-as (KeyStroke/getKeyStroke "control shift S"))
+                            (.setAccelerator item-close (KeyStroke/getKeyStroke "control W"))
+                            (.setAccelerator item-exit (KeyStroke/getKeyStroke "control Q"))
                             (.addActionListener item-new (proxy [ActionListener] [] (actionPerformed [e] (file-new!))))
                             (.addActionListener item-open (proxy [ActionListener] [] (actionPerformed [e] (file-open!))))
                             (.addActionListener item-save (proxy [ActionListener] [] (actionPerformed [e] (file-save!))))
                             (.addActionListener item-save-as (proxy [ActionListener] [] (actionPerformed [e] (file-save-as!))))
-                            (.addActionListener item-exit (proxy [ActionListener] [] (actionPerformed [e] (file-exit!))))
+                            (.addActionListener item-close (proxy [ActionListener] [] (actionPerformed [e] (close-window!))))
+                            (.addActionListener item-exit (proxy [ActionListener] [] (actionPerformed [e] (exit-application!))))
                             (.add menu-file item-new)
                             (.add menu-file item-open)
                             (.add menu-file item-save)
                             (.add menu-file item-save-as)
                             (.addSeparator menu-file)
+                            (.add menu-file item-close)
                             (.add menu-file item-exit))
 
                       ;; Edit Menu
@@ -1533,7 +1584,9 @@
                     (.addWindowListener frame
                       (proxy [WindowAdapter] []
                         (windowClosing [e]
-                          (file-exit!))))
+                          (close-window!))
+                        (windowClosed [e]
+                          (swap! active-windows dissoc frame))))
 
                     ;; Layout frame
                     (.setPreferredSize frame (Dimension. 950 720))
@@ -1541,3 +1594,26 @@
                     (.setLocationRelativeTo frame nil)
                     (.requestFocusInWindow editor)
                     frame)))))))))))
+
+(defn open-ide-window!
+  "Creates, positions, and displays a new DrClojure window.
+   If parent-frame is provided and showing, cascades the new window relative to parent-frame."
+  ([] (open-ide-window! nil nil))
+  ([initial-file] (open-ide-window! initial-file nil))
+  ([initial-file parent-frame]
+   (let [frame (create-ide initial-file)]
+     (if (and parent-frame (instance? JFrame parent-frame) (.isShowing ^JFrame parent-frame))
+       (try
+         (let [loc (.getLocationOnScreen ^JFrame parent-frame)
+               screen-bounds (.. (GraphicsEnvironment/getLocalGraphicsEnvironment)
+                                 getDefaultScreenDevice
+                                 getDefaultConfiguration
+                                 getBounds)
+               new-x (min (+ (.x loc) 30) (max 0 (- (.width screen-bounds) 400)))
+               new-y (min (+ (.y loc) 30) (max 0 (- (.height screen-bounds) 300)))]
+           (.setLocation frame (max 0 (int new-x)) (max 0 (int new-y))))
+         (catch Throwable _
+           (try (.setLocationRelativeTo frame parent-frame) (catch Throwable _ nil))))
+       (.setLocationRelativeTo frame nil))
+     (.setVisible frame true)
+     frame)))
