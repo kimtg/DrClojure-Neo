@@ -54,11 +54,11 @@
       "|(#[?@]?\"(?>\\\\.|[^\"\\\\])*\"?)"                         ;; Group 2: regex literal
       "|(\"(?>\\\\.|[^\"\\\\])*\"?)"                               ;; Group 3: string literal
       "|(\\\\(?:newline|space|tab|backspace|formfeed|return|u[0-9a-fA-F]{4}|o[0-3]?[0-7]{1,2}|.))" ;; Group 4: character
-      "|(::?[a-zA-Z0-9_.!$%&*+\\-/<=>?#]+)"                        ;; Group 5: keyword
+      "|(::?[-_a-zA-Z0-9\\p{L}\\p{N}.!$%&*+/<=>?#]+)"             ;; Group 5: keyword
       "|([+-]?(?:0x[0-9a-fA-F]+|\\d+(?:/\\d+|\\.\\d+)?(?:[eE][+-]?\\d+)?[MN]?)(?=[\\s()\\[\\]{}\",]|$))" ;; Group 6: number
       "|([()\\[\\]{}])"                                            ;; Group 7: bracket / delimiter
-      "|(\\^[a-zA-Z0-9_.!$%&*+\\-/<=>?#:]+)"                       ;; Group 8: metadata tag
-      "|([a-zA-Z0-9_.!$%&*+\\-/<=>?#]+)")))                        ;; Group 9: symbol
+      "|(\\^[-_a-zA-Z0-9\\p{L}\\p{N}.!$%&*+/<=>?#:]+)"            ;; Group 8: metadata tag
+      "|([-_a-zA-Z\\p{L}.!$%&*+/<=>?][-_a-zA-Z0-9\\p{L}\\p{N}.!$%&*+/<=>?#]*)"))) ;; Group 9: symbol
 
 (defn tokenize
   "Scans `text` and returns a vector of tuples `[token-type start end]`.
@@ -278,22 +278,61 @@
 
 (defn symbol-at-pos
   "Returns a map `{:symbol str, :start int, :end int, :type keyword}` for the symbol
-   covering or immediately adjacent to `pos` in `text`.
-   Returns nil if caret is not on a code symbol."
+   covering or immediately around `pos` in `text`.
+   Returns nil if caret is not on or adjacent to a code symbol (e.g. inside comments, strings, or blank space)."
   [^String text pos]
   (when (and (string? text) (pos? (.length text)))
-    (let [tokens (tokenize text)
-          sym-tokens (filter #(contains? #{:symbol :special-form :builtin :constant} (first %)) tokens)
-          pos (min (.length text) (max 0 (int pos)))]
-      (if-let [tok (or (first (filter (fn [[_ s e]] (<= s pos e)) sym-tokens))
-                       (when (pos? pos)
-                         (first (filter (fn [[_ s e]] (= e pos)) sym-tokens))))]
-        (let [[tok-type s e] tok]
-          {:symbol (.substring text s e)
-           :start s
-           :end e
-           :type tok-type})
-        nil))))
+    (let [len (.length text)
+          pos (min len (max 0 (int (or pos 0))))
+          tokens (tokenize text)
+          in-literal? (some (fn [[tok-type s e]]
+                              (when (contains? #{:comment :string :regex :char} tok-type)
+                                (if (= tok-type :comment)
+                                  (<= s pos e)
+                                  (and (<= s pos) (<= pos e)))))
+                            tokens)]
+      (when-not in-literal?
+        (let [sym-tokens (filter #(contains? #{:symbol :special-form :builtin :constant} (first %)) tokens)]
+          (when (seq sym-tokens)
+            ;; 1. Direct match: pos is inside or at boundary of a symbol token
+            (if-let [exact (or (first (filter (fn [[_ s e]] (and (<= s pos) (< pos e))) sym-tokens))
+                               (first (filter (fn [[_ s e]] (<= s pos e)) sym-tokens)))]
+              (let [[tok-type s e] exact]
+                {:symbol (.substring text s e) :start s :end e :type tok-type})
+
+              ;; 2. Proximity match: pos is on a delimiter/prefix/space immediately adjacent to a symbol
+              (let [ch (when (< pos len) (.charAt text pos))
+                    prev-ch (when (pos? pos) (.charAt text (dec pos)))
+                    candidates
+                    (keep (fn [[tok-type s e]]
+                            (let [dist (cond
+                                         (< pos s) (- s pos)
+                                         (> pos e) (- pos e)
+                                         :else 0)]
+                              (when (<= dist 2)
+                                (let [intervening (if (< pos s)
+                                                    (.substring text pos s)
+                                                    (.substring text e pos))]
+                                  (when (and (not (re-find #"[\r\n]" intervening))
+                                             (re-matches #"^[()\[\]{}@'~`^#, ]*$" intervening)
+                                             (or (<= dist 1)
+                                                 (re-find #"[()\[\]{}@'~`^#,]" intervening)))
+                                    (let [score (cond
+                                                  ;; Opening delimiters and reader prefixes bind forward to next symbol
+                                                  (and (< pos s) (#{\( \[ \{ \@ \' \~ \^ \` \#} ch))
+                                                  (- dist 0.5)
+
+                                                  ;; Closing delimiters bind backward to preceding symbol
+                                                  (and (> pos e) (or (#{\) \] \}} ch)
+                                                                     (#{\) \] \}} prev-ch)))
+                                                  (- dist 0.5)
+
+                                                  :else (double dist))]
+                                      {:tok [tok-type s e] :score score :dist dist}))))))
+                          sym-tokens)]
+                (when-let [best (first (sort-by :score candidates))]
+                  (let [[tok-type s e] (:tok best)]
+                    {:symbol (.substring text s e) :start s :end e :type tok-type}))))))))))
 
 (defn find-symbol-occurrences
   "Returns a vector of `[start end]` positions for all occurrences of `sym-name`

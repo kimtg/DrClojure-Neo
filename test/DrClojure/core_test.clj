@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
-  (:import (javax.swing JTextPane KeyStroke)
+  (:import (javax.swing JFrame JTextPane KeyStroke)
            (javax.swing.text DefaultStyledDocument)))
 
 (deftest app-metadata-test
@@ -119,3 +119,44 @@
       (is (some #{"Indent Selection"} items))
       (is (some #{"Unindent Selection"} items))
       (.dispose frame))))
+
+(deftest jump-to-definition-no-selection-test
+  (testing "Jump to definition with caret only (no selection) on multi-line code"
+    (let [frame (JFrame.)
+          editor (JTextPane.)
+          status-atom (atom nil)
+          set-status! (fn [msg] (reset! status-atom msg))
+          code (str "(defn calculate-total [price tax]\n"
+                    "  (+ price tax))\n\n"
+                    "(defn print-receipt [item]\n"
+                    "  (calculate-total 100 10))\n")]
+      (.setText editor code)
+      ;; Place caret on "calculate-total" on line 5 without selection
+      (let [target-offset (.indexOf code "calculate-total 100")]
+        (is (pos? target-offset))
+        (.setCaretPosition editor target-offset)
+        (is (nil? (.getSelectedText editor)))
+        (ui/jump-to-definition! frame editor set-status!)
+        ;; Should jump to line 1 definition and select "calculate-total"
+        (is (= 6 (.getSelectionStart editor)))
+        (is (= 21 (.getSelectionEnd editor)))
+        (is (= "calculate-total" (.getSelectedText editor)))
+        (is (= "Jumped to definition of 'calculate-total' (line 1)" @status-atom))))
+
+    (testing "Jump to definition on Unicode / Korean symbol without selection"
+      (let [frame (JFrame.)
+            editor (JTextPane.)
+            status-atom (atom nil)
+            set-status! (fn [msg] (reset! status-atom msg))
+            code (str "(defn 넓이-계산 [가로 세로]\n"
+                      "  (* 가로 세로))\n\n"
+                      "(넓이-계산 10 20)\n")]
+        (.setText editor code)
+        (let [usage-offset (.indexOf code "(넓이-계산 10")]
+          ;; Place caret on '(' immediately before 넓이-계산
+          (.setCaretPosition editor usage-offset)
+          (ui/jump-to-definition! frame editor set-status!)
+          (is (= 6 (.getSelectionStart editor)))
+          (is (= 11 (.getSelectionEnd editor)))
+          (is (= "넓이-계산" (.getSelectedText editor)))
+          (is (= "Jumped to definition of '넓이-계산' (line 1)" @status-atom)))))))

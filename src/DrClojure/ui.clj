@@ -18,7 +18,7 @@
                      KeyboardFocusManager Toolkit Desktop Desktop$Action)
            (java.net URI)
            (java.awt.event ActionEvent ActionListener KeyEvent KeyAdapter
-                           WindowAdapter WindowEvent)))
+                           MouseAdapter MouseEvent WindowAdapter WindowEvent)))
 
 (def app-name "DrClojure")
 (def app-version "0.3.0")
@@ -76,7 +76,8 @@
          (caretUpdate [e]
            (clear-highlights!)
            (let [caret (.getCaretPosition editor)
-                 doc-text (.getText editor)
+                 d (.getDocument editor)
+                 doc-text (.getText d 0 (.getLength d))
                  len (.length doc-text)]
              (when (pos? len)
                (let [binfo (or (and bracket-info-atom @bracket-info-atom)
@@ -197,10 +198,11 @@
    If defined in current buffer, moves caret, selects symbol, and scrolls into view.
    If external Var, displays definition info dialog with namespace, file, and arglists."
   [^JFrame frame ^JTextComponent editor set-status!]
-  (let [sel (.getSelectedText editor)
+  (let [doc (.getDocument editor)
+        text (.getText doc 0 (.getLength doc))
+        sel (.getSelectedText editor)
         caret (.getCaretPosition editor)
-        text (.getText editor)
-        sym-info (if (and (not (str/blank? sel)) (re-matches #"^[-a-zA-Z0-9_.!$%&*+/<=>?#]+$" (str/trim sel)))
+        sym-info (if (and (not (str/blank? sel)) (re-matches #"^[-_a-zA-Z0-9\p{L}\p{N}.!$%&*+/<=>?#]+$" (str/trim sel)))
                    {:symbol (str/trim sel) :start (.getSelectionStart editor) :end (.getSelectionEnd editor)}
                    (syntax/symbol-at-pos text caret))]
     (if-not sym-info
@@ -256,10 +258,11 @@
   "Prompts user for a new symbol name and renames all occurrences of the symbol
    under cursor in the editor. Updates syntax highlighting and document dirty state."
   [^JFrame frame ^JTextComponent editor highlight-now! update-title! set-status!]
-  (let [sel (.getSelectedText editor)
+  (let [doc (.getDocument editor)
+        text (.getText doc 0 (.getLength doc))
+        sel (.getSelectedText editor)
         caret (.getCaretPosition editor)
-        text (.getText editor)
-        sym-info (if (and (not (str/blank? sel)) (re-matches #"^[-a-zA-Z0-9_.!$%&*+/<=>?#]+$" (str/trim sel)))
+        sym-info (if (and (not (str/blank? sel)) (re-matches #"^[-_a-zA-Z0-9\p{L}\p{N}.!$%&*+/<=>?#]+$" (str/trim sel)))
                    {:symbol (str/trim sel) :start (.getSelectionStart editor) :end (.getSelectionEnd editor)}
                    (syntax/symbol-at-pos text caret))]
     (if-not sym-info
@@ -282,15 +285,14 @@
               (set-status! "Symbol name unchanged.")
 
               (or (empty? new-sym)
-                  (not (re-matches #"^[-a-zA-Z0-9_.!$%&*+/<=>?#]+$" new-sym)))
+                  (not (re-matches #"^[-_a-zA-Z0-9\p{L}\p{N}.!$%&*+/<=>?#]+$" new-sym)))
               (JOptionPane/showMessageDialog frame
                 (str "Invalid Clojure symbol name: \"" new-sym "\"")
                 "Rename Error"
                 JOptionPane/ERROR_MESSAGE)
 
               :else
-              (let [doc (.getDocument editor)
-                    doc-text (.getText doc 0 (.getLength doc))
+              (let [doc-text (.getText doc 0 (.getLength doc))
                     occs (syntax/find-symbol-occurrences doc-text old-sym)]
                 (if (empty? occs)
                   (set-status! (str "No occurrences of '" old-sym "' found to rename."))
@@ -333,6 +335,17 @@
     (.add popup item-cut)
     (.add popup item-copy)
     (.add popup item-paste)
+    (.addMouseListener editor
+      (proxy [MouseAdapter] []
+        (mousePressed [^MouseEvent e]
+          (when (SwingUtilities/isRightMouseButton e)
+            (when (str/blank? (.getSelectedText editor))
+              (let [pt (.getPoint e)
+                    pos (try (.viewToModel2D editor pt)
+                             (catch Exception _
+                               (.viewToModel editor pt)))]
+                (when (and (number? pos) (>= pos 0))
+                  (.setCaretPosition editor (int pos)))))))))
     (.setComponentPopupMenu editor popup)))
 
 (defn setup-undo! [^JTextComponent editor]

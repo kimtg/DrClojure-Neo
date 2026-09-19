@@ -189,10 +189,41 @@
 (deftest symbol-at-pos-test
   (let [code "(defn greet [name]\n  ; a comment\n  \"a string\"\n  (println name))"]
     (testing "Extracting symbol under or adjacent to cursor"
-      (is (= "defn" (:symbol (syntax/symbol-at-pos code 2))))
-      (is (= "greet" (:symbol (syntax/symbol-at-pos code 7))))
-      (is (= "name" (:symbol (syntax/symbol-at-pos code 15))))
-      (is (= "println" (:symbol (syntax/symbol-at-pos code 50)))))
+      (is (= "defn" (:symbol (syntax/symbol-at-pos code 0))))  ;; cursor on '(' touching defn
+      (is (= "defn" (:symbol (syntax/symbol-at-pos code 1))))  ;; start of defn
+      (is (= "defn" (:symbol (syntax/symbol-at-pos code 2))))  ;; inside defn
+      (is (= "defn" (:symbol (syntax/symbol-at-pos code 5))))  ;; end of defn
+      (is (= "greet" (:symbol (syntax/symbol-at-pos code 6)))) ;; start of greet
+      (is (= "greet" (:symbol (syntax/symbol-at-pos code 7)))) ;; inside greet
+      (is (= "greet" (:symbol (syntax/symbol-at-pos code 11)))) ;; end of greet
+      (is (= "name" (:symbol (syntax/symbol-at-pos code 12)))) ;; on '[' touching name
+      (is (= "name" (:symbol (syntax/symbol-at-pos code 13)))) ;; start of name
+      (is (= "name" (:symbol (syntax/symbol-at-pos code 15)))) ;; inside name
+      (is (= "name" (:symbol (syntax/symbol-at-pos code 17)))) ;; on ']' touching name
+      (is (= "println" (:symbol (syntax/symbol-at-pos code 47)))) ;; on '(' touching println
+      (is (= "println" (:symbol (syntax/symbol-at-pos code 50))))) ;; inside println
+
+    (testing "Cursor on reader macros / prefixes"
+      (is (= "my-atom" (:symbol (syntax/symbol-at-pos "@my-atom" 0))))   ;; on @
+      (is (= "my-atom" (:symbol (syntax/symbol-at-pos "@my-atom" 1))))   ;; after @
+      (is (= "my-sym" (:symbol (syntax/symbol-at-pos "'my-sym" 0))))     ;; on '
+      (is (= "my-var" (:symbol (syntax/symbol-at-pos "#'my-var" 0))))    ;; on #
+      (is (= "my-var" (:symbol (syntax/symbol-at-pos "#'my-var" 1))))    ;; on '
+      (is (= "my-var" (:symbol (syntax/symbol-at-pos "#'my-var" 2))))    ;; on m
+      (is (= "my-splice" (:symbol (syntax/symbol-at-pos "~@my-splice" 0)))) ;; on ~
+      (is (= "my-splice" (:symbol (syntax/symbol-at-pos "~@my-splice" 1)))) ;; on @
+      (is (= "my-splice" (:symbol (syntax/symbol-at-pos "~@my-splice" 2))))) ;; on m
+
+    (testing "Closing delimiters touching symbol"
+      (is (= "foo" (:symbol (syntax/symbol-at-pos "(foo)" 0))))  ;; on (
+      (is (= "foo" (:symbol (syntax/symbol-at-pos "(foo)" 4))))  ;; on )
+      (is (= "foo" (:symbol (syntax/symbol-at-pos "(foo)" 5))))) ;; right after )
+
+    (testing "Unicode / Korean symbol extraction"
+      (let [k-code "(defn 넓이-계산 [가로 세로] (* 가로 세로))"]
+        (is (= "넓이-계산" (:symbol (syntax/symbol-at-pos k-code 6))))
+        (is (= "가로" (:symbol (syntax/symbol-at-pos k-code 13))))
+        (is (= "세로" (:symbol (syntax/symbol-at-pos k-code 16))))))
 
     (testing "Cursor in comments or strings returns nil"
       ;; Offset 23 is inside "; a comment"
@@ -200,9 +231,10 @@
       ;; Offset 37 is inside "\"a string\""
       (is (nil? (syntax/symbol-at-pos code 37))))
 
-    (testing "Cursor at whitespace or boundary"
+    (testing "Cursor at empty text, blank lines, or boundaries"
       (is (nil? (syntax/symbol-at-pos "" 0)))
-      (is (nil? (syntax/symbol-at-pos nil 0))))))
+      (is (nil? (syntax/symbol-at-pos nil 0)))
+      (is (nil? (syntax/symbol-at-pos "(foo)\n\n\n(bar)" 7))))))
 
 (deftest find-symbol-occurrences-test
   (let [code (str "(defn count-items [items]\n"
