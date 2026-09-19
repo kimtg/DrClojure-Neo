@@ -27,7 +27,6 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 - **Multi-Window Editing (`File -> New`)**: Press `Ctrl+N` to spawn independent DrClojure IDE windows with isolated file buffers, REPL evaluation contexts, and undo stacks for multi-file workflows. Closing a single window via `Ctrl+W` or the title bar keeps other windows active, exiting cleanly only when the last window is closed.
 - **Clojure Syntax Highlighting**: Real-time syntax coloring for special forms, built-ins, constants, keywords, strings, characters, numbers, and comments.
 - **Undo / Redo with Dirty Tracking**: Standard `Ctrl+Z` / `Ctrl+Y` support with clean undo isolation and accurate `*` unsaved changes tracking that automatically restores clean state on undo.
-- **Flexible Editor Width**: Code editor dynamically fills the window width while enabling horizontal scrollbars only when lines exceed the pane width.
 - **Clojure Cheatsheet**: Press `F1` or click Cheatsheet to open [Clojure - Cheatsheet](https://clojure.org/api/cheatsheet) in your web browser, with offline reference examples also available.
 - **Zero External Heavy Dependencies**: Runs directly with standard Clojure and Java Swing.
 

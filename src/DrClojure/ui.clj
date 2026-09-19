@@ -547,7 +547,7 @@
         _ (do (.setText text-area content)
               (.setEditable text-area false)
               (.setCaretPosition text-area 0)
-              (.setFont text-area (Font. "Consolas" Font/PLAIN 13))
+              (.setFont text-area (Font. Font/MONOSPACED Font/PLAIN 13))
               (.setBackground text-area (Color. 250 250 250))
               (.setBorder text-area (BorderFactory/createEmptyBorder 8 10 8 10)))
         scroll (JScrollPane. text-area)
@@ -630,6 +630,8 @@
 
         find-field (JTextField. 16)
         replace-field (JTextField. 16)
+        _ (do (.setFont find-field (Font. Font/MONOSPACED Font/PLAIN 12))
+              (.setFont replace-field (Font. Font/MONOSPACED Font/PLAIN 12)))
         match-label (JLabel. "No matches")
         _ (.setForeground match-label (Color. 120 120 120))
         match-case-cb (JCheckBox. "Match Case")
@@ -839,7 +841,7 @@
 ;; --- Autocomplete Popup & Controller ---
 
 (defn- create-autocomplete-renderer []
-  (let [font-mono (Font. "Consolas" Font/PLAIN 12)
+  (let [font-mono (Font. Font/MONOSPACED Font/PLAIN 12)
         bg-selected (Color. 220 235 252)
         fg-selected (Color. 0 0 0)
         bg-normal Color/WHITE
@@ -1052,7 +1054,7 @@
          _ (.setEditable doc-area false)
          _ (.setLineWrap doc-area true)
          _ (.setWrapStyleWord doc-area true)
-         _ (.setFont doc-area (Font. "Consolas" Font/PLAIN 12))
+         _ (.setFont doc-area (Font. Font/MONOSPACED Font/PLAIN 12))
          _ (.setBackground doc-area (Color. 250 250 252))
          _ (.setForeground doc-area (Color. 40 40 40))
          _ (.setMargin doc-area (Insets. 6 8 6 8))
@@ -1431,7 +1433,7 @@
         panel (JPanel. (BorderLayout. 8 8))
         text-area (JTextArea. 24 60)
         _ (do (.setEditable text-area false)
-              (.setFont text-area (Font. "Consolas" Font/PLAIN 13)))
+              (.setFont text-area (Font. Font/MONOSPACED Font/PLAIN 13)))
         sb (StringBuilder.)
         _ (doseq [[category items] cheatsheet-data]
             (.append sb (str "\n;; === " category " ===\n\n"))
@@ -1491,7 +1493,7 @@
 
 (defn create-ide [initial-file]
   (let [init-content (if (and (not (str/blank? initial-file)) (.exists (java.io.File. initial-file)))
-                       (try (slurp initial-file) (catch Exception _ ""))
+                       (try (slurp initial-file :encoding "UTF-8") (catch Exception _ ""))
                        "")
         _ (when (seq init-content)
             (syntax/warm-buffer-cache-async! init-content))
@@ -1539,8 +1541,9 @@
               (.setForeground output-area (Color. 30 30 30)))
         output-scroll (JScrollPane. output-area)
         prompt-label (JLabel. " > ")
-        _ (.setFont prompt-label (Font. "Consolas" Font/BOLD 14))
+        _ (.setFont prompt-label (Font. Font/MONOSPACED Font/BOLD 14))
         input-field (JTextField.)
+        _ (.setName input-field "repl-input")
         prompt-panel (JPanel. (BorderLayout. 4 0))
         _ (do (.add prompt-panel prompt-label BorderLayout/WEST)
               (.add prompt-panel input-field BorderLayout/CENTER))
@@ -1583,8 +1586,8 @@
 
     ;; --- Setup Fonts ---
     (letfn [(apply-font! [sz]
-              (let [f (Font. "Consolas" Font/PLAIN sz)
-                    fb (Font. "Consolas" Font/BOLD sz)]
+              (let [f (Font. Font/MONOSPACED Font/PLAIN sz)
+                    fb (Font. Font/MONOSPACED Font/BOLD sz)]
                 (.setFont editor f)
                 (.setFont line-numbers f)
                 (.setFont output-area f)
@@ -1919,7 +1922,7 @@
               (letfn [(save-file-to! [file-path]
                         (try
                           (let [text (.getText editor)]
-                            (spit file-path text)
+                            (spit file-path text :encoding "UTF-8")
                             (reset! cur-file file-path)
                             (reset! saved-content text)
                             (reset! dirty? false)
@@ -1990,7 +1993,7 @@
                             (let [f (.getSelectedFile fc)
                                   path (.getCanonicalPath f)]
                               (try
-                                (let [content (slurp path)]
+                                (let [content (slurp path :encoding "UTF-8")]
                                   (reset! cur-file path)
                                   (reset! saved-content content)
                                   (reset! dirty? false)

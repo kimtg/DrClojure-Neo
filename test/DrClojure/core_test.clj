@@ -3,7 +3,8 @@
             [clojure.string :as str]
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
-  (:import (java.awt.event KeyEvent)
+  (:import (java.awt Font)
+           (java.awt.event KeyEvent)
            (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList JTextArea JTextField JComponent JLabel SwingUtilities DefaultListModel)
            (javax.swing.text DefaultStyledDocument)))
 
@@ -918,7 +919,7 @@
           (is (every? #(str/starts-with? (str/lower-case (:symbol %)) "prin")
                       (for [i (range filtered-count)]
                         (.getElementAt ^DefaultListModel (:model @popup-atom) i)))))
-        (ui/dismiss-autocomplete! popup-atom)))
+        (ui/dismiss-autocomplete! popup-atom))))
 
   (testing "trigger-autocomplete! with blank prefix displays popup with fixed cell dimensions"
     (let [editor (JTextPane.)
@@ -952,4 +953,55 @@
       (ui/update-autocomplete-filter! popup-atom {:sync? true})
       (let [{:keys [model]} @popup-atom]
         (is (> (.getSize ^DefaultListModel model) 600)))
-      (ui/dismiss-autocomplete! popup-atom)))))
+      (ui/dismiss-autocomplete! popup-atom))))
+
+(deftest korean-input-and-font-test
+  (testing "Code font uses Font.MONOSPACED and can display Korean (한글) characters"
+    (let [frame (ui/create-ide nil)]
+      (try
+        (let [pane (.getContentPane frame)
+              components (tree-seq #(instance? java.awt.Container %) #(.getComponents %) pane)
+              editor (first (filter #(instance? JTextPane %) components))
+              input-field (first (filter #(and (instance? JTextField %) (= "repl-input" (.getName %))) components))
+              output-area (first (filter #(instance? JTextArea %) components))]
+          (is (some? editor))
+          (is (some? input-field))
+          (is (some? output-area))
+          (let [f-editor (.getFont editor)
+                f-input (.getFont input-field)
+                f-output (.getFont output-area)]
+            ;; Verify font families are Monospaced
+            (is (= Font/MONOSPACED (.getFamily f-editor)))
+            (is (= Font/MONOSPACED (.getFamily f-input)))
+            (is (= Font/MONOSPACED (.getFamily f-output)))
+            ;; Verify all fonts can display Korean characters without missing-glyph tofu
+            (is (.canDisplay f-editor (first "한")))
+            (is (.canDisplay f-input (first "한")))
+            (is (.canDisplay f-output (first "한")))
+            (is (= -1 (.canDisplayUpTo f-editor "한글 Clojure 코드 테스트")))
+            (is (= -1 (.canDisplayUpTo f-input "한글 REPL 입력 테스트")))
+            (is (= -1 (.canDisplayUpTo f-output "한글 출력 테스트")))))
+        (finally
+          (.dispose frame)))))
+
+  (testing "Korean letters (한글) in definitions editor and REPL input field"
+    (let [frame (ui/create-ide nil)]
+      (try
+        (let [pane (.getContentPane frame)
+              components (tree-seq #(instance? java.awt.Container %) #(.getComponents %) pane)
+              editor (first (filter #(instance? JTextPane %) components))
+              input-field (first (filter #(and (instance? JTextField %) (= "repl-input" (.getName %))) components))
+              korean-code "(defn 넓이-계산 [가로 세로]\n  \"사각형의 넓이를 계산합니다.\"\n  (* 가로 세로))\n\n(넓이-계산 10 20)"
+              korean-repl "(println \"안녕하세요 세계!\")"]
+          ;; Definitions editor
+          (.setText editor korean-code)
+          (is (= korean-code (.getText editor)))
+          (is (.contains (.getText editor) "넓이-계산"))
+          (is (.contains (.getText editor) "사각형의 넓이를 계산합니다."))
+
+          ;; REPL input field
+          (.setText input-field korean-repl)
+          (is (= korean-repl (.getText input-field)))
+          (is (.contains (.getText input-field) "안녕하세요 세계!")))
+        (finally
+          (.dispose frame))))))
