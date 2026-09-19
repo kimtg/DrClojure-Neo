@@ -578,7 +578,7 @@
                            " Interactions (Bottom): REPL expressions & GUI standard input\n"
                            " Stdin Console: Use (read-line) in code; input is prompted below\n"
                            " Cheatsheet: Click [Cheatsheet] or press F1 to open Clojure Cheatsheet in browser\n"
-                           "------------------------------------------------------------\n\n"))))]
+                           "------------------------------------------------------------\n"))))]
           (print-banner!)
 
           ;; Status Updater
