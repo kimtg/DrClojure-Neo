@@ -477,3 +477,218 @@
            :kind (:kind def-target)}
           {:status :not-found
            :symbol sym-name})))))
+
+;; --- Clojure Code Formatter ---
+
+(def body-indent-forms
+  #{"def" "defn" "defn-" "defmacro" "defmulti" "defmethod" "defprotocol"
+    "defrecord" "deftype" "definterface" "defonce"
+    "let" "loop" "recur" "binding" "with-open" "with-local-vars" "with-redefs"
+    "with-out-str" "with-in-str" "with-precision"
+    "if" "if-not" "if-let" "if-some" "when" "when-not" "when-let" "when-first" "when-some"
+    "cond" "condp" "case" "do"
+    "fn" "fn*" "doseq" "dotimes" "for" "while"
+    "try" "catch" "finally" "throw" "locking"
+    "ns" "testing" "deftest" "is" "are" "comment"
+    "extend-protocol" "extend-type" "reify" "proxy"
+    "alt!" "alts!" "go" "go-loop"})
+
+(defn- body-form? [op]
+  (when op
+    (or (contains? body-indent-forms op)
+        (str/starts-with? op "def")
+        (str/starts-with? op "with-")
+        (str/starts-with? op "when-")
+        (str/starts-with? op "if-"))))
+
+(defn compute-line-indentations
+  "Calculates the target indentation (in spaces) for each line of `text`.
+   Returns a vector of integers or `:verbatim` (for lines within multiline strings)."
+  [^String text]
+  (if (or (nil? text) (zero? (.length text)))
+    []
+    (let [lines (str/split text #"\n" -1)
+          n (count lines)
+          line-starts (loop [ls lines, off 0, acc []]
+                        (if (empty? ls)
+                          acc
+                          (recur (rest ls) (+ off (count (first ls)) 1) (conj acc off))))
+          tokens (tokenize text)
+          multiline-string-lines
+          (set (for [[tok-type s e] tokens
+                     :when (or (= tok-type :string) (= tok-type :regex))
+                     line-idx (range n)
+                     :let [ls (nth line-starts line-idx)]
+                     :when (< s ls e)]
+                 line-idx))]
+      (loop [line-idx 0
+             tok-idx 0
+             stack []
+             deltas []
+             indents []]
+        (if (>= line-idx n)
+          indents
+          (let [line (nth lines line-idx)
+                ls (nth line-starts line-idx)
+                first-non-ws (let [len (.length line)]
+                               (loop [col 0]
+                                 (cond
+                                   (>= col len) nil
+                                   (not (Character/isWhitespace (.charAt line col))) col
+                                   :else (recur (inc col)))))
+                target-offset (if first-non-ws (+ ls first-non-ws) ls)
+                ;; Advance tok-idx processing all tokens with end <= target-offset
+                [new-tok-idx new-stack]
+                (loop [ti tok-idx, st stack]
+                  (if (or (>= ti (count tokens))
+                          (> (nth (nth tokens ti) 2) target-offset))
+                    [ti st]
+                    (let [[tok-type s e] (nth tokens ti)
+                          tok-line (loop [l 0]
+                                     (if (or (>= l (dec n))
+                                             (< s (nth line-starts (inc l))))
+                                       l
+                                       (recur (inc l))))
+                          tok-delta (if (< tok-line line-idx)
+                                      (nth deltas tok-line 0)
+                                      0)
+                          tok-col (+ (- s (nth line-starts tok-line)) tok-delta)
+                          tok-str (.substring text s e)]
+                      (cond
+                        (= tok-type :bracket)
+                        (let [ch (.charAt tok-str 0)]
+                          (cond
+                            (#{\( \[ \{} ch)
+                            (recur (inc ti)
+                                   (conj st {:type (case ch \( :list \[ :vector \{ :map)
+                                             :open-char ch
+                                             :close-char (case ch \( \) \[ \] \{ \})
+                                             :line tok-line
+                                             :col tok-col
+                                             :operator nil
+                                             :first-arg-col nil
+                                             :first-child-col nil}))
+                            (#{\) \] \}} ch)
+                            (let [match-idx (first (keep-indexed
+                                                     (fn [i frame] (when (= (:close-char frame) ch) i))
+                                                     (reverse st)))]
+                              (recur (inc ti)
+                                     (if match-idx
+                                       (subvec st 0 (- (count st) (inc match-idx)))
+                                       st)))
+                            :else (recur (inc ti) st)))
+
+                        (not= tok-type :comment)
+                        ;; Code token: operator or argument
+                        (if (empty? st)
+                          (recur (inc ti) st)
+                          (let [top (peek st)]
+                            (if (= (:type top) :list)
+                              (if (nil? (:operator top))
+                                (recur (inc ti) (conj (pop st) (assoc top :operator tok-str)))
+                                (if (and (nil? (:first-arg-col top)) (= (:line top) tok-line))
+                                  (recur (inc ti) (conj (pop st) (assoc top :first-arg-col tok-col)))
+                                  (recur (inc ti) st)))
+                              ;; vector or map
+                              (if (and (nil? (:first-child-col top)) (= (:line top) tok-line))
+                                (recur (inc ti) (conj (pop st) (assoc top :first-child-col tok-col)))
+                                (recur (inc ti) st)))))
+
+                        :else
+                        (recur (inc ti) st)))))]
+            ;; Calculate indentation for line-idx
+            (let [line-indent
+                  (cond
+                    (multiline-string-lines line-idx) :verbatim
+                    (nil? first-non-ws) 0
+                    (empty? new-stack) 0
+                    :else
+                    (let [first-char (.charAt line first-non-ws)
+                          top (peek new-stack)]
+                      (if (and (= first-char (:close-char top))
+                               (not= line-idx (:line top)))
+                        (:col top)
+                        (case (:type top)
+                          :vector (if (:first-child-col top)
+                                    (:first-child-col top)
+                                    (+ (:col top) 2))
+                          :map (if (:first-child-col top)
+                                 (:first-child-col top)
+                                 (+ (:col top) 2))
+                          :list (cond
+                                  (body-form? (:operator top))
+                                  (+ (:col top) 2)
+
+                                  (contains? #{"->" "->>" "as->" "cond->" "cond->>" "some->" "some->>"}
+                                             (:operator top))
+                                  (if (:first-arg-col top)
+                                    (:first-arg-col top)
+                                    (+ (:col top) 2))
+
+                                  :else
+                                  (if (:first-arg-col top)
+                                    (:first-arg-col top)
+                                    (+ (:col top) 2)))))))
+                  old-indent (or first-non-ws 0)
+                  delta (if (= line-indent :verbatim) 0 (- line-indent old-indent))]
+              (recur (inc line-idx)
+                     new-tok-idx
+                     new-stack
+                     (conj deltas delta)
+                     (conj indents line-indent)))))))))
+
+(defn format-code
+  "Formats Clojure `text` by re-indenting lines according to syntactic nesting
+   and cleaning trailing whitespace. Preserves multiline strings and empty lines."
+  [^String text]
+  (if (str/blank? text)
+    text
+    (let [lines (str/split text #"\n" -1)
+          indents (compute-line-indentations text)
+          formatted-lines (mapv (fn [line indent]
+                                  (cond
+                                    (= indent :verbatim) line
+                                    (str/blank? line) ""
+                                    :else
+                                    (let [trimmed (str/triml line)
+                                          clean (str/replace trimmed #"[ \t]+$" "")]
+                                      (str (apply str (repeat indent " ")) clean))))
+                                lines
+                                indents)]
+      (str/join "\n" formatted-lines))))
+
+(defn format-selection-text
+  "Formats only the lines spanned by `start-offset` to `end-offset` in `text`.
+   Lines outside the range are preserved exactly as-is."
+  [^String text start-offset end-offset]
+  (if (or (str/blank? text) (>= start-offset end-offset))
+    text
+    (let [lines (str/split text #"\n" -1)
+          indents (compute-line-indentations text)
+          line-starts (loop [ls lines, off 0, acc []]
+                        (if (empty? ls)
+                          acc
+                          (recur (rest ls) (+ off (count (first ls)) 1) (conj acc off))))
+          n (count lines)
+          offset->line (fn [pos]
+                         (loop [i 0]
+                           (if (or (>= i (dec n))
+                                   (< pos (nth line-starts (inc i))))
+                             i
+                             (recur (inc i)))))
+          start-line (offset->line start-offset)
+          end-line (offset->line (max start-offset (dec end-offset)))
+          formatted-lines (map-indexed
+                            (fn [idx line]
+                              (if (<= start-line idx end-line)
+                                (let [indent (nth indents idx)]
+                                  (cond
+                                    (= indent :verbatim) line
+                                    (str/blank? line) ""
+                                    :else
+                                    (let [trimmed (str/triml line)
+                                          clean (str/replace trimmed #"[ \t]+$" "")]
+                                      (str (apply str (repeat indent " ")) clean))))
+                                line))
+                            lines)]
+      (str/join "\n" formatted-lines))))

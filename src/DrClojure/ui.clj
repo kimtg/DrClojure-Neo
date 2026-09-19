@@ -226,6 +226,54 @@
           (when-not (str/blank? t)
             (.insertString doc s "; " nil)))))))
 
+;; --- Clojure Code Formatting ---
+
+(defn format-all!
+  "Re-indents and formats the entire document in `editor` according to Clojure syntax rules."
+  ([^JTextComponent editor] (format-all! editor nil))
+  ([^JTextComponent editor status-fn]
+   (let [old-text (.getText editor)
+         new-text (syntax/format-code old-text)]
+     (if (= old-text new-text)
+       (when status-fn (status-fn " Already formatted "))
+       (let [caret (.getCaretPosition editor)
+             max-len (.length new-text)]
+         (.setText editor new-text)
+         (.setCaretPosition editor (min max-len caret))
+         (when status-fn (status-fn " Formatted entire document ")))))))
+
+(defn format-selection!
+  "Re-indents and formats the active selection or current line in `editor`."
+  ([^JTextComponent editor] (format-selection! editor nil))
+  ([^JTextComponent editor status-fn]
+   (let [old-text (.getText editor)
+         sel-start (.getSelectionStart editor)
+         sel-end (.getSelectionEnd editor)]
+     (if (not= sel-start sel-end)
+       ;; Format selected lines
+       (let [new-text (syntax/format-selection-text old-text sel-start sel-end)]
+         (if (= old-text new-text)
+           (when status-fn (status-fn " Selection already formatted "))
+           (let [caret (.getCaretPosition editor)
+                 max-len (.length new-text)]
+             (.setText editor new-text)
+             (.setCaretPosition editor (min max-len caret))
+             (when status-fn (status-fn " Formatted selection ")))))
+       ;; No selection: format current line
+       (let [pos (.getCaretPosition editor)
+             doc-len (.length old-text)
+             line-start (let [idx (.lastIndexOf old-text "\n" (max 0 (dec pos)))]
+                          (if (neg? idx) 0 (inc idx)))
+             line-end (let [idx (.indexOf old-text "\n" pos)]
+                        (if (neg? idx) doc-len idx))
+             new-text (syntax/format-selection-text old-text line-start line-end)]
+         (if (= old-text new-text)
+           (when status-fn (status-fn " Line already formatted "))
+           (let [max-len (.length new-text)]
+             (.setText editor new-text)
+             (.setCaretPosition editor (min max-len pos))
+             (when status-fn (status-fn " Formatted current line ")))))))))
+
 ;; --- Smart Auto-Indent on Enter ---
 
 (defn handle-smart-enter!
@@ -758,57 +806,65 @@
      :find-prev! find-prev!}))
 
 (defn setup-editor-context-menu!
-  "Attaches a right-click context menu to the editor with navigation, refactoring, and edit actions."
-  [^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! find-fn! replace-fn!]
-  (let [popup (JPopupMenu.)
-        item-jump (JMenuItem. "Jump to Definition (F12)")
-        item-rename (JMenuItem. "Rename Symbol... (Shift+F6)")
-        item-doc (JMenuItem. "Quick Documentation (Ctrl+Q)")
-        item-comment (JMenuItem. "Toggle Comment (Ctrl+/)")
-        item-indent (JMenuItem. "Indent Selection (Tab)")
-        item-unindent (JMenuItem. "Unindent Selection (Shift+Tab)")
-        item-find (JMenuItem. "Find... (Ctrl+F)")
-        item-replace (JMenuItem. "Replace... (Ctrl+H)")
-        item-cut (JMenuItem. "Cut")
-        item-copy (JMenuItem. "Copy")
-        item-paste (JMenuItem. "Paste")]
-    (.addActionListener item-jump (proxy [ActionListener] [] (actionPerformed [e] (jump-fn!))))
-    (.addActionListener item-rename (proxy [ActionListener] [] (actionPerformed [e] (rename-fn!))))
-    (.addActionListener item-doc (proxy [ActionListener] [] (actionPerformed [e] (doc-fn!))))
-    (.addActionListener item-comment (proxy [ActionListener] [] (actionPerformed [e] (comment-fn!))))
-    (.addActionListener item-indent (proxy [ActionListener] [] (actionPerformed [e] (indent-selection! editor))))
-    (.addActionListener item-unindent (proxy [ActionListener] [] (actionPerformed [e] (unindent-selection! editor))))
-    (.addActionListener item-find (proxy [ActionListener] [] (actionPerformed [e] (find-fn!))))
-    (.addActionListener item-replace (proxy [ActionListener] [] (actionPerformed [e] (replace-fn!))))
-    (.addActionListener item-cut (proxy [ActionListener] [] (actionPerformed [e] (.cut editor))))
-    (.addActionListener item-copy (proxy [ActionListener] [] (actionPerformed [e] (.copy editor))))
-    (.addActionListener item-paste (proxy [ActionListener] [] (actionPerformed [e] (.paste editor))))
-    (.add popup item-jump)
-    (.add popup item-rename)
-    (.add popup item-doc)
-    (.addSeparator popup)
-    (.add popup item-comment)
-    (.add popup item-indent)
-    (.add popup item-unindent)
-    (.addSeparator popup)
-    (.add popup item-find)
-    (.add popup item-replace)
-    (.addSeparator popup)
-    (.add popup item-cut)
-    (.add popup item-copy)
-    (.add popup item-paste)
-    (.addMouseListener editor
-      (proxy [MouseAdapter] []
-        (mousePressed [^MouseEvent e]
-          (when (SwingUtilities/isRightMouseButton e)
-            (when (str/blank? (.getSelectedText editor))
-              (let [pt (.getPoint e)
-                    pos (try (.viewToModel2D editor pt)
-                             (catch Exception _
-                               (.viewToModel editor pt)))]
-                (when (and (number? pos) (>= pos 0))
-                  (.setCaretPosition editor (int pos)))))))))
-    (.setComponentPopupMenu editor popup)))
+  "Attaches a right-click context menu to the editor with navigation, refactoring, formatting, and edit actions."
+  ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! find-fn! replace-fn!]
+   (setup-editor-context-menu! editor jump-fn! rename-fn! doc-fn! comment-fn! nil nil find-fn! replace-fn!))
+  ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! find-fn! replace-fn!]
+   (let [popup (JPopupMenu.)
+         item-jump (JMenuItem. "Jump to Definition (F12)")
+         item-rename (JMenuItem. "Rename Symbol... (Shift+F6)")
+         item-doc (JMenuItem. "Quick Documentation (Ctrl+Q)")
+         item-format-all (JMenuItem. "Format All (Ctrl+Shift+F)")
+         item-format-sel (JMenuItem. "Format Selection (Ctrl+Alt+F)")
+         item-comment (JMenuItem. "Toggle Comment (Ctrl+/)")
+         item-indent (JMenuItem. "Indent Selection (Tab)")
+         item-unindent (JMenuItem. "Unindent Selection (Shift+Tab)")
+         item-find (JMenuItem. "Find... (Ctrl+F)")
+         item-replace (JMenuItem. "Replace... (Ctrl+H)")
+         item-cut (JMenuItem. "Cut")
+         item-copy (JMenuItem. "Copy")
+         item-paste (JMenuItem. "Paste")]
+     (.addActionListener item-jump (proxy [ActionListener] [] (actionPerformed [e] (when jump-fn! (jump-fn!)))))
+     (.addActionListener item-rename (proxy [ActionListener] [] (actionPerformed [e] (when rename-fn! (rename-fn!)))))
+     (.addActionListener item-doc (proxy [ActionListener] [] (actionPerformed [e] (when doc-fn! (doc-fn!)))))
+     (.addActionListener item-format-all (proxy [ActionListener] [] (actionPerformed [e] (if format-all-fn! (format-all-fn!) (format-all! editor)))))
+     (.addActionListener item-format-sel (proxy [ActionListener] [] (actionPerformed [e] (if format-sel-fn! (format-sel-fn!) (format-selection! editor)))))
+     (.addActionListener item-comment (proxy [ActionListener] [] (actionPerformed [e] (when comment-fn! (comment-fn!)))))
+     (.addActionListener item-indent (proxy [ActionListener] [] (actionPerformed [e] (indent-selection! editor))))
+     (.addActionListener item-unindent (proxy [ActionListener] [] (actionPerformed [e] (unindent-selection! editor))))
+     (.addActionListener item-find (proxy [ActionListener] [] (actionPerformed [e] (when find-fn! (find-fn!)))))
+     (.addActionListener item-replace (proxy [ActionListener] [] (actionPerformed [e] (when replace-fn! (replace-fn!)))))
+     (.addActionListener item-cut (proxy [ActionListener] [] (actionPerformed [e] (.cut editor))))
+     (.addActionListener item-copy (proxy [ActionListener] [] (actionPerformed [e] (.copy editor))))
+     (.addActionListener item-paste (proxy [ActionListener] [] (actionPerformed [e] (.paste editor))))
+     (.add popup item-jump)
+     (.add popup item-rename)
+     (.add popup item-doc)
+     (.addSeparator popup)
+     (.add popup item-format-all)
+     (.add popup item-format-sel)
+     (.add popup item-comment)
+     (.add popup item-indent)
+     (.add popup item-unindent)
+     (.addSeparator popup)
+     (.add popup item-find)
+     (.add popup item-replace)
+     (.addSeparator popup)
+     (.add popup item-cut)
+     (.add popup item-copy)
+     (.add popup item-paste)
+     (.addMouseListener editor
+       (proxy [MouseAdapter] []
+         (mousePressed [^MouseEvent e]
+           (when (SwingUtilities/isRightMouseButton e)
+             (when (str/blank? (.getSelectedText editor))
+               (let [pt (.getPoint e)
+                     pos (try (.viewToModel2D editor pt)
+                              (catch Exception _
+                                (.viewToModel editor pt)))]
+                 (when (and (number? pos) (>= pos 0))
+                   (.setCaretPosition editor (int pos)))))))))
+     (.setComponentPopupMenu editor popup))))
 
 (defn setup-undo! [^JTextComponent editor]
   (let [undo-mgr (javax.swing.undo.UndoManager.)
@@ -1146,6 +1202,16 @@
                       (update-dirty!)
                       (highlight-now!))
 
+                    (format-all-action! []
+                      (format-all! editor set-status!)
+                      (update-dirty!)
+                      (highlight-now!))
+
+                    (format-selection-action! []
+                      (format-selection! editor set-status!)
+                      (update-dirty!)
+                      (highlight-now!))
+
                     (quick-doc-action! []
                       (show-quick-doc! frame editor))]
 
@@ -1266,6 +1332,18 @@
                     (proxy [javax.swing.AbstractAction] []
                       (actionPerformed [e] (find-prev!))))
 
+                  ;; Format All (Ctrl+Shift+F) & Format Selection (Ctrl+Alt+F, Ctrl+Alt+L)
+                  (.put im (KeyStroke/getKeyStroke "control shift F") "format-all")
+                  (.put am "format-all"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (format-all-action!))))
+
+                  (.put im (KeyStroke/getKeyStroke "control alt F") "format-selection")
+                  (.put im (KeyStroke/getKeyStroke "control alt L") "format-selection")
+                  (.put am "format-selection"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (format-selection-action!))))
+
                   (.put im (KeyStroke/getKeyStroke "ESCAPE") "editor-escape")
                   (.put am "editor-escape"
                     (proxy [javax.swing.AbstractAction] []
@@ -1274,7 +1352,7 @@
                           (close-find!)
                           (stop-current-eval!))))))
 
-                (setup-editor-context-menu! editor jump-action! rename-action! quick-doc-action! comment-action! open-find! open-replace!)
+                (setup-editor-context-menu! editor jump-action! rename-action! quick-doc-action! comment-action! format-all-action! format-selection-action! open-find! open-replace!)
 
                 (.. editor getDocument (addDocumentListener
                   (proxy [DocumentListener] []
@@ -1416,7 +1494,6 @@
                             (.setAccelerator item-save (KeyStroke/getKeyStroke "control S"))
                             (.setAccelerator item-save-as (KeyStroke/getKeyStroke "control shift S"))
                             (.setAccelerator item-close (KeyStroke/getKeyStroke "control W"))
-                            (.setAccelerator item-exit (KeyStroke/getKeyStroke "control Q"))
                             (.addActionListener item-new (proxy [ActionListener] [] (actionPerformed [e] (file-new!))))
                             (.addActionListener item-open (proxy [ActionListener] [] (actionPerformed [e] (file-open!))))
                             (.addActionListener item-save (proxy [ActionListener] [] (actionPerformed [e] (file-save!))))
@@ -1443,6 +1520,8 @@
                       item-jump (JMenuItem. "Jump to Definition")
                       item-rename (JMenuItem. "Rename Symbol...")
                       item-doc (JMenuItem. "Quick Documentation")
+                      item-format-all (JMenuItem. "Format All")
+                      item-format-sel (JMenuItem. "Format Selection")
                       item-comment (JMenuItem. "Toggle Comment")
                       item-indent (JMenuItem. "Indent Selection")
                       item-unindent (JMenuItem. "Unindent Selection")
@@ -1456,6 +1535,8 @@
                             (.setAccelerator item-jump (KeyStroke/getKeyStroke "F12"))
                             (.setAccelerator item-rename (KeyStroke/getKeyStroke "shift F6"))
                             (.setAccelerator item-doc (KeyStroke/getKeyStroke "control Q"))
+                            (.setAccelerator item-format-all (KeyStroke/getKeyStroke "control shift F"))
+                            (.setAccelerator item-format-sel (KeyStroke/getKeyStroke "control alt F"))
                             (.setAccelerator item-comment (KeyStroke/getKeyStroke "control SLASH"))
                             (.setAccelerator item-indent (KeyStroke/getKeyStroke "TAB"))
                             (.setAccelerator item-unindent (KeyStroke/getKeyStroke "shift TAB"))
@@ -1469,6 +1550,8 @@
                             (.addActionListener item-jump (proxy [ActionListener] [] (actionPerformed [e] (jump-action!))))
                             (.addActionListener item-rename (proxy [ActionListener] [] (actionPerformed [e] (rename-action!))))
                             (.addActionListener item-doc (proxy [ActionListener] [] (actionPerformed [e] (quick-doc-action!))))
+                            (.addActionListener item-format-all (proxy [ActionListener] [] (actionPerformed [e] (format-all-action!))))
+                            (.addActionListener item-format-sel (proxy [ActionListener] [] (actionPerformed [e] (format-selection-action!))))
                             (.addActionListener item-comment (proxy [ActionListener] [] (actionPerformed [e] (comment-action!))))
                             (.addActionListener item-indent (proxy [ActionListener] [] (actionPerformed [e] (indent-selection! editor))))
                             (.addActionListener item-unindent (proxy [ActionListener] [] (actionPerformed [e] (unindent-selection! editor))))
@@ -1485,6 +1568,8 @@
                             (.add menu-edit item-rename)
                             (.add menu-edit item-doc)
                             (.addSeparator menu-edit)
+                            (.add menu-edit item-format-all)
+                            (.add menu-edit item-format-sel)
                             (.add menu-edit item-comment)
                             (.add menu-edit item-indent)
                             (.add menu-edit item-unindent)

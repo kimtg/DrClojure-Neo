@@ -122,6 +122,8 @@
       (is (contains? items "Jump to Definition"))
       (is (contains? items "Rename Symbol..."))
       (is (contains? items "Quick Documentation"))
+      (is (contains? items "Format All"))
+      (is (contains? items "Format Selection"))
       (is (contains? items "Toggle Comment"))
       (is (contains? items "Indent Selection"))
       (is (contains? items "Unindent Selection"))
@@ -467,3 +469,70 @@
           (reset! ui/exit-handler orig-handler)
           (.dispose frame1)
           (.dispose frame2))))))
+
+(deftest format-editor-test
+  (testing "Format All re-indents document and preserves caret"
+    (let [editor (JTextPane.)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          unindented "(defn greet [name]\n(println (str \"hello, \" name)))\n"]
+      (.setText editor unindented)
+      (.setCaretPosition editor 5)
+      (ui/format-all! editor status-fn)
+      (is (= "(defn greet [name]\n  (println (str \"hello, \" name)))\n" (.getText editor)))
+      (is (= 5 (.getCaretPosition editor)))
+      (is (= " Formatted entire document " @status-msg))
+
+      ;; Calling format-all! again when already formatted
+      (ui/format-all! editor status-fn)
+      (is (= " Already formatted " @status-msg))))
+
+  (testing "Format Selection only formats selected range"
+    (let [editor (JTextPane.)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          code (str "(defn a []\n"
+                    "1)\n"
+                    "(defn b []\n"
+                    "2)\n")]
+      (.setText editor code)
+      ;; Select (defn b [] \n 2)
+      (let [b-idx (.indexOf code "(defn b")]
+        (.setSelectionStart editor b-idx)
+        (.setSelectionEnd editor (.length code))
+        (ui/format-selection! editor status-fn)
+        (is (= (str "(defn a []\n"
+                    "1)\n"
+                    "(defn b []\n"
+                    "  2)\n")
+               (.getText editor)))
+        (is (= " Formatted selection " @status-msg)))))
+
+  (testing "Format Selection without selection formats current line"
+    (let [editor (JTextPane.)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          code (str "(defn foo []\n"
+                    "bar)\n")]
+      (.setText editor code)
+      ;; Caret on "bar" without selection
+      (.setCaretPosition editor (.indexOf code "bar"))
+      (is (nil? (.getSelectedText editor)))
+      (ui/format-selection! editor status-fn)
+      (is (= "(defn foo []\n  bar)\n" (.getText editor)))
+      (is (= " Formatted current line " @status-msg))))
+
+  (testing "Edit menu format accelerators"
+    (let [frame (ui/create-ide nil)
+          menubar (.getJMenuBar frame)
+          edit-menu (.getMenu menubar 1)
+          item-count (.getItemCount edit-menu)
+          items (into {} (keep (fn [i] (when-let [it (.getItem edit-menu i)] [(.getText it) it]))
+                               (range item-count)))
+          item-format-all (get items "Format All")
+          item-format-sel (get items "Format Selection")]
+      (is (some? item-format-all))
+      (is (= (KeyStroke/getKeyStroke "control shift F") (.getAccelerator item-format-all)))
+      (is (some? item-format-sel))
+      (is (= (KeyStroke/getKeyStroke "control alt F") (.getAccelerator item-format-sel)))
+      (.dispose frame))))

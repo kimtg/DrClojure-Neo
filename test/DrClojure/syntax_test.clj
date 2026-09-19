@@ -359,4 +359,93 @@
     (let [doc-info (syntax/get-symbol-doc "unknown-sym-xyz")]
       (is (= :not-found (:status doc-info))))))
 
+(deftest format-code-test
+  (testing "Format unindented defn and let"
+    (let [unformatted (str "(defn calculate-sum [a b]\n"
+                           "(let [x (* a 2)\n"
+                           "y (* b 2)]\n"
+                           "(+ x y)))\n")
+          expected (str "(defn calculate-sum [a b]\n"
+                        "  (let [x (* a 2)\n"
+                        "        y (* b 2)]\n"
+                        "    (+ x y)))\n")]
+      (is (= expected (syntax/format-code unformatted)))))
+
+  (testing "Format cond expression"
+    (let [unformatted (str "(cond\n"
+                           "(= x 1) :one\n"
+                           "(= x 2) :two\n"
+                           ":else :other)\n")
+          expected (str "(cond\n"
+                        "  (= x 1) :one\n"
+                        "  (= x 2) :two\n"
+                        "  :else :other)\n")]
+      (is (= expected (syntax/format-code unformatted)))))
+
+  (testing "Format try-catch-finally expression"
+    (let [unformatted (str "(try\n"
+                           "(do-work)\n"
+                           "(catch Exception e\n"
+                           "(log-error e))\n"
+                           "(finally\n"
+                           "(cleanup)))\n")
+          expected (str "(try\n"
+                        "  (do-work)\n"
+                        "  (catch Exception e\n"
+                        "    (log-error e))\n"
+                        "  (finally\n"
+                        "    (cleanup)))\n")]
+      (is (= expected (syntax/format-code unformatted)))))
+
+  (testing "Format vector and map alignment"
+    (let [unformatted (str "{:first-name \"John\"\n"
+                           ":last-name \"Doe\"\n"
+                           ":scores [100\n"
+                           "200\n"
+                           "300]}\n")
+          expected (str "{:first-name \"John\"\n"
+                        " :last-name \"Doe\"\n"
+                        " :scores [100\n"
+                        "          200\n"
+                        "          300]}\n")]
+      (is (= expected (syntax/format-code unformatted)))))
+
+  (testing "Preserves multiline strings verbatim"
+    (let [code (str "(def docstring\n"
+                    "  \"This is a line\n"
+                    "   This is indented in string\n"
+                    "     More spaces in string\")\n")]
+      (is (= code (syntax/format-code code)))))
+
+  (testing "Comments are indented properly"
+    (let [unformatted (str "(defn greet []\n"
+                           ";; Print friendly greeting\n"
+                           "(println \"hello\"))\n")
+          expected (str "(defn greet []\n"
+                        "  ;; Print friendly greeting\n"
+                        "  (println \"hello\"))\n")]
+      (is (= expected (syntax/format-code unformatted)))))
+
+  (testing "Empty and blank lines are preserved without trailing spaces"
+    (let [unformatted "(defn a []\n\n  1)\n\n(defn b []\n  2)"
+          formatted (syntax/format-code unformatted)]
+      (is (= unformatted formatted)))))
+
+(deftest format-selection-text-test
+  (testing "Formats only selected lines and leaves others unchanged"
+    (let [unformatted (str "(defn a []\n"
+                           "1)\n"
+                           "(defn b []\n"
+                           "2)\n")
+          ;; Select only (defn b [] \n 2)
+          start-offset (.indexOf unformatted "(defn b")
+          end-offset (.length unformatted)
+          formatted (syntax/format-selection-text unformatted start-offset end-offset)
+          expected (str "(defn a []\n"
+                        "1)\n"
+                        "(defn b []\n"
+                        "  2)\n")]
+      ;; (defn a [] \n 1) should remain unindented (not touched)
+      (is (= expected formatted)))))
+
 
