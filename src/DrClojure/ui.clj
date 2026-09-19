@@ -277,8 +277,16 @@
 
 ;; --- Smart Auto-Indent on Enter ---
 
+(def open->matching-close
+  {\( \), \[ \], \{ \}, \" \"})
+
+(def close-delimiters
+  #{\) \] \} \"})
+
 (defn handle-smart-enter!
-  "Inserts a newline and auto-computes the appropriate indentation spaces based on open Clojure forms."
+  "Inserts a newline and auto-computes the appropriate indentation spaces based on open Clojure forms.
+   If cursor is between matched bracket delimiters (e.g. `(|)`, `[|]`, `{|}`), creates an indented line
+   for the cursor and pushes the closing delimiter onto a dedented line."
   [^JTextComponent editor]
   (let [doc (.getDocument editor)
         sel-start (.getSelectionStart editor)
@@ -288,18 +296,25 @@
       (.setCaretPosition editor sel-start))
     (let [pos (.getCaretPosition editor)
           text (.getText doc 0 (.getLength doc))
-          indent (syntax/compute-smart-indent text pos)
-          insert-str (str "\n" indent)]
-      (.insertString doc pos insert-str nil)
-      (.setCaretPosition editor (+ pos (count insert-str))))))
-
-;; --- Auto-Closing Delimiters & Selection Wrapping ---
-
-(def open->matching-close
-  {\( \), \[ \], \{ \}, \" \"})
-
-(def close-delimiters
-  #{\) \] \} \"})
+          line-start (let [idx (.lastIndexOf text "\n" (dec pos))]
+                       (if (neg? idx) 0 (inc idx)))
+          line-prefix (.substring text line-start pos)
+          prev-ch (when (pos? pos) (.charAt text (dec pos)))
+          next-ch (when (< pos (.length text)) (.charAt text pos))
+          between-pair? (and prev-ch next-ch
+                             (contains? #{\( \[ \{} prev-ch)
+                             (= (open->matching-close prev-ch) next-ch))]
+      (if between-pair?
+        (let [base-indent (or (re-find #"^[ ]+" line-prefix) "")
+              inner-indent (str base-indent "  ")
+              close-indent base-indent
+              insert-str (str "\n" inner-indent "\n" close-indent)]
+          (.insertString doc pos insert-str nil)
+          (.setCaretPosition editor (+ pos 1 (count inner-indent))))
+        (let [indent (syntax/compute-smart-indent text pos)
+              insert-str (str "\n" indent)]
+          (.insertString doc pos insert-str nil)
+          (.setCaretPosition editor (+ pos (count insert-str))))))))
 
 (defn setup-auto-brackets!
   "Attaches key listener to editor for auto-closing brackets, delimiter wrapping of selections,

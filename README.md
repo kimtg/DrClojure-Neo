@@ -13,7 +13,7 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 - **REPL Command History**: Navigate previous REPL commands in the prompt using `Up` and `Down` arrow keys.
 - **In-Editor Find & Replace**: Press `Ctrl+F` (or `Ctrl+H` / `Ctrl+R` for Replace) to toggle the docked search bar. Features live match count ("X of Y"), case-sensitivity toggle, `F3` / `Shift+F3` navigation, and single or Replace-All replacements.
 - **Autocomplete (`Ctrl+Space`)**: Code completion with prefix matching ("starts with"). Candidate pool includes Clojure special forms (`def`, `defn`, `let`, `if`, `when`, `cond`, etc.), core built-ins (`map`, `filter`, `println`, etc.), and user-defined buffer definitions/symbols. Features instant completion for single matches and a dual-pane popup with keyboard (`Up`/`Down`/`PageUp`/`PageDown`) and mouse navigation, real-time documentation and parameter list (`arglists`) preview for the currently selected symbol, `Enter`/`Tab` insertion, `Escape` cancellation, and dynamic prefix filtering as you type.
-- **Smart Auto-Indent on Enter**: Pressing `Enter` in the editor automatically carries forward the base indentation and indents 2 spaces when forms or brackets remain open.
+- **Smart Auto-Indent & Auto-Dedent on Enter**: Pressing `Enter` automatically indents 2 spaces when forms or brackets remain open, auto-dedents 2 spaces per closed bracket level when forms are closed (or when inserting a newline immediately before closing brackets), expands paired delimiters (`(|)`, `[|]`, `{|}`) with an indented middle line and dedented closing delimiter, and preserves indentation when forms on the line are balanced.
 - **Toggle Line Comment**: Press `Ctrl+/` or `Ctrl+;` to instantly toggle line comments (`; `) on the current line or selected multi-line blocks while preserving empty lines.
 - **Quick Symbol Documentation**: Press `Ctrl+Q` or `Shift+F1` on any symbol to view its namespace, arglists, docstring, and source location in a non-modal monospace popup.
 - **Delimiter Auto-Closing & Selection Wrapping**: Automatically inserts closing delimiters for `()`, `[]`, `{}`, and `""`, wraps selected text when typing an open delimiter, supports stepping over closing delimiters, and deletes matching pairs on backspace.
@@ -109,7 +109,7 @@ clj -M:test
 | `Ctrl + F` | Open Find panel |
 | `Ctrl + H` / `Ctrl + R` | Open Replace panel |
 | `F3` / `Shift + F3` | Find Next / Find Previous match |
-| `Enter` | Smart auto-indent (preserves base + 2 spaces for open forms) |
+| `Enter` | Smart auto-indent and auto-dedent (indents for open forms, dedents for closed forms) |
 | `Ctrl + /` / `Ctrl + ;` | Toggle Line Comment (`; `) on line or selection |
 | `Ctrl + Q` / `Shift + F1` | Quick Symbol Documentation (docstring, arglists, source) |
 | `Ctrl + Space` | Autocomplete code symbol with real-time docstring & arglists preview |

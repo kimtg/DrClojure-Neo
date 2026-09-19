@@ -407,16 +407,22 @@
 
 (defn compute-smart-indent
   "Calculates the appropriate indentation spaces string for a new line created at `pos` in `text`.
-   Carries forward current line indentation, and adds 2 spaces if the line opened unclosed brackets."
+   - Auto-indents (+2 spaces) when the line opened unclosed forms.
+   - Auto-dedents (-2 spaces per net closed bracket) when the line closed forms.
+   - Auto-dedents (-2 spaces per closing bracket) when inserting a newline immediately before closing brackets.
+   - Preserves indentation when brackets on the line are balanced."
   [^String text pos]
   (if (or (nil? text) (not (pos? (.length text))) (not (pos? pos)))
     ""
     (let [pos (min (.length text) (max 0 (int pos)))
           line-start (let [idx (.lastIndexOf text "\n" (dec pos))]
                        (if (neg? idx) 0 (inc idx)))
+          line-end (let [idx (.indexOf text "\n" pos)]
+                     (if (neg? idx) (.length text) idx))
           line-prefix (.substring text line-start pos)
+          line-suffix (.substring text pos line-end)
           base-indent (or (re-find #"^[ ]+" line-prefix) "")
-          ;; Count unclosed brackets in the code part of line-prefix
+          base-len (.length ^String base-indent)
           tokens (tokenize line-prefix)
           open-brackets (count (filter (fn [[tok-type s _]]
                                          (and (= tok-type :bracket)
@@ -427,8 +433,31 @@
                                                (close->open (.charAt line-prefix s))))
                                         tokens))
           unclosed (- open-brackets close-brackets)
-          extra-indent (if (pos? unclosed) "  " "")]
-      (str base-indent extra-indent))))
+          suffix-tokens (tokenize line-suffix)
+          leading-suffix-close (count (take-while (fn [[tok-type s _]]
+                                                    (and (= tok-type :bracket)
+                                                         (close->open (.charAt line-suffix s))))
+                                                  suffix-tokens))]
+      (cond
+        ;; 1. Line-prefix closed more brackets than it opened: Auto-dedent
+        (neg? unclosed)
+        (let [dedent-spaces (* 2 (- unclosed))
+              target (max 0 (- base-len dedent-spaces))]
+          (apply str (repeat target " ")))
+
+        ;; 2. Inserting immediately before closing bracket(s) and prefix didn't open forms: Auto-dedent
+        (and (pos? leading-suffix-close) (<= unclosed 0))
+        (let [dedent-spaces (* 2 leading-suffix-close)
+              target (max 0 (- base-len dedent-spaces))]
+          (apply str (repeat target " ")))
+
+        ;; 3. Line-prefix opened unclosed brackets: Auto-indent (+2 spaces)
+        (pos? unclosed)
+        (str base-indent "  ")
+
+        ;; 4. Balanced brackets on current line: Preserve existing indentation
+        :else
+        base-indent))))
 
 (defn find-text-matches
   "Finds all occurrences of `query` in `text`.

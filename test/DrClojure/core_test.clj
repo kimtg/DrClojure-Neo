@@ -236,7 +236,48 @@
         (.setSelectionStart pane idx)
         (.setSelectionEnd pane (+ idx 10))
         (ui/handle-smart-enter! pane)
-        (is (= "(foo [x] \n  )" (.getText pane)))))))
+        (is (= "(foo [x] \n  )" (.getText pane))))))
+
+  (testing "Smart enter auto-dedents when previous line closed forms"
+    (let [pane (JTextPane.)]
+      ;; Line with 4 spaces closes 1 form -> new line auto-dedents to 2 spaces
+      (.setText pane "(defn foo [x]\n  (let [a 1]\n    (+ a 1)))")
+      ;; Caret at end of '(+ a 1))' (pos 39)
+      (.setCaretPosition pane 39)
+      (ui/handle-smart-enter! pane)
+      (is (= "(defn foo [x]\n  (let [a 1]\n    (+ a 1))\n  )" (.getText pane))))
+    (let [pane (JTextPane.)]
+      ;; Line with 4 spaces closes all forms -> new line auto-dedents to 0 spaces
+      (.setText pane "(defn foo [x]\n  (let [a 1]\n    (+ a 1)))")
+      (.setCaretPosition pane (.length (.getText pane)))
+      (ui/handle-smart-enter! pane)
+      (is (= "(defn foo [x]\n  (let [a 1]\n    (+ a 1)))\n" (.getText pane)))))
+
+  (testing "Smart enter between paired delimiters expands with indented body and dedented closing bracket"
+    (let [pane (JTextPane.)]
+      (.setText pane "()")
+      (.setCaretPosition pane 1)
+      (ui/handle-smart-enter! pane)
+      (is (= "(\n  \n)" (.getText pane)))
+      (is (= 4 (.getCaretPosition pane))))
+    (let [pane (JTextPane.)]
+      (.setText pane "[]")
+      (.setCaretPosition pane 1)
+      (ui/handle-smart-enter! pane)
+      (is (= "[\n  \n]" (.getText pane)))
+      (is (= 4 (.getCaretPosition pane))))
+    (let [pane (JTextPane.)]
+      (.setText pane "{}")
+      (.setCaretPosition pane 1)
+      (ui/handle-smart-enter! pane)
+      (is (= "{\n  \n}" (.getText pane)))
+      (is (= 4 (.getCaretPosition pane))))
+    (let [pane (JTextPane.)]
+      ;; Nested between delimiters carries forward base indent + 2 and dedents closing delimiter
+      (.setText pane "  (let [x 1]\n    ())")
+      (.setCaretPosition pane (+ (.indexOf (.getText pane) "(" 12) 1))
+      (ui/handle-smart-enter! pane)
+      (is (= "  (let [x 1]\n    (\n      \n    ))" (.getText pane))))))
 
 (deftest find-replace-panel-test
   (testing "Inline find and replace panel operations"

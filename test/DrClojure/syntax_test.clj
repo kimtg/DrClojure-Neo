@@ -311,9 +311,31 @@
     (let [code "  (let [x 10\n"]
       (is (= "    " (syntax/compute-smart-indent code 12)))))
 
-  (testing "Preserves existing indentation when all forms on line are closed"
+  (testing "Preserves existing indentation when all forms on line are balanced"
+    (let [code "  (println \"hello\")\n"]
+      (is (= "  " (syntax/compute-smart-indent code 19)))))
+
+  (testing "Auto-dedents when line closed forms"
+    ;; Line with 4 spaces closes 1 form -> dedents 2 spaces to 2 spaces
+    (let [code "    (println \"hello\"))\n"]
+      (is (= "  " (syntax/compute-smart-indent code 22))))
+    ;; Line with 4 spaces closes 2 forms -> dedents 4 spaces to 0 spaces
+    (let [code "    (println \"hello\")))\n"]
+      (is (= "" (syntax/compute-smart-indent code 23))))
+    ;; Line with 2 spaces closes 1 form -> dedents 2 spaces to 0 spaces
     (let [code "  (println \"hello\"))\n"]
-      (is (= "  " (syntax/compute-smart-indent code 20)))))
+      (is (= "" (syntax/compute-smart-indent code 20)))))
+
+  (testing "Auto-dedents when inserting newline immediately before closing brackets"
+    (let [code "    (+ a 1))"]
+      ;; Cursor right before outer ')' (pos = 11): 1 closing bracket in suffix -> dedents 2 spaces to 2 spaces
+      (is (= "  " (syntax/compute-smart-indent code 11))))
+    (let [code "    (+ a 1)))"]
+      ;; Cursor right before outer '))' (pos = 11): 2 closing brackets in suffix -> dedents 4 spaces to 0 spaces
+      (is (= "" (syntax/compute-smart-indent code 11))))
+    (let [code "    (+ a 1)"]
+      ;; Cursor right after '(+ a 1)' with balanced forms -> preserves base indent
+      (is (= "    " (syntax/compute-smart-indent code 11)))))
 
   (testing "Handles blank or empty inputs"
     (is (= "" (syntax/compute-smart-indent "" 0)))
