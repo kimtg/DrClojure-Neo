@@ -12,7 +12,7 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 - **Asynchronous Execution & Stop Button**: Long-running loops or calculations run off the UI thread and can be safely interrupted at any time via the **Stop** button or `Escape`.
 - **REPL Command History**: Navigate previous REPL commands in the prompt using `Up` and `Down` arrow keys.
 - **In-Editor Find & Replace**: Press `Ctrl+F` (or `Ctrl+H` / `Ctrl+R` for Replace) to toggle the docked search bar. Features live match count ("X of Y"), case-sensitivity toggle, `F3` / `Shift+F3` navigation, and single or Replace-All replacements.
-- **Autocomplete (`Ctrl+Space`)**: Code completion with prefix matching ("starts with"). Candidate pool includes Clojure special forms (`def`, `defn`, `let`, `if`, `when`, `cond`, etc.), core built-ins (`map`, `filter`, `println`, etc.), and user-defined buffer definitions/symbols. Features instant completion for single matches and a lightweight scrollable popup with `Up`/`Down` navigation, `Enter`/`Tab` insertion, `Escape` cancellation, and real-time filtering.
+- **Autocomplete (`Ctrl+Space`)**: Code completion with prefix matching ("starts with"). Candidate pool includes Clojure special forms (`def`, `defn`, `let`, `if`, `when`, `cond`, etc.), core built-ins (`map`, `filter`, `println`, etc.), and user-defined buffer definitions/symbols. Features instant completion for single matches and a dual-pane popup with keyboard (`Up`/`Down`/`PageUp`/`PageDown`) and mouse navigation, real-time documentation and parameter list (`arglists`) preview for the currently selected symbol, `Enter`/`Tab` insertion, `Escape` cancellation, and dynamic prefix filtering as you type.
 - **Smart Auto-Indent on Enter**: Pressing `Enter` in the editor automatically carries forward the base indentation and indents 2 spaces when forms or brackets remain open.
 - **Toggle Line Comment**: Press `Ctrl+/` or `Ctrl+;` to instantly toggle line comments (`; `) on the current line or selected multi-line blocks while preserving empty lines.
 - **Quick Symbol Documentation**: Press `Ctrl+Q` or `Shift+F1` on any symbol to view its namespace, arglists, docstring, and source location in a non-modal monospace popup.
@@ -112,7 +112,7 @@ clj -M:test
 | `Enter` | Smart auto-indent (preserves base + 2 spaces for open forms) |
 | `Ctrl + /` / `Ctrl + ;` | Toggle Line Comment (`; `) on line or selection |
 | `Ctrl + Q` / `Shift + F1` | Quick Symbol Documentation (docstring, arglists, source) |
-| `Ctrl + Space` | Autocomplete code symbol (special forms, builtins, user definitions) |
+| `Ctrl + Space` | Autocomplete code symbol with real-time docstring & arglists preview |
 | `(` `[` `{` `"` | Auto-close delimiter / wrap selection |
 | `Backspace` | Delete paired delimiters together |
 | `Ctrl + L` | Clear Output / reset console |

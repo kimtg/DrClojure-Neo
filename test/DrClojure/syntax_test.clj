@@ -355,9 +355,83 @@
       (is (= 1 (:line doc-info)))
       (is (= :def (:kind doc-info)))))
 
+  (testing "Lookup special form doc directly via get-symbol-doc"
+    (let [def-doc (syntax/get-symbol-doc "def")
+          if-doc (syntax/get-symbol-doc "if")]
+      (is (= :found (:status def-doc)))
+      (is (true? (:special-form def-doc)))
+      (is (string? (:doc def-doc)))
+      (is (.contains (:arglists def-doc) "def"))
+      (is (= :found (:status if-doc)))
+      (is (true? (:special-form if-doc)))
+      (is (string? (:doc if-doc)))))
+
+  (testing "Lookup buffer defined symbol with docstring and params"
+    (let [code "(defn calculate-total\n  \"Calculates the final total with tax.\"\n  [subtotal tax-rate]\n  (* subtotal (+ 1 tax-rate)))\n"
+          doc-info (syntax/get-symbol-doc "calculate-total" code)]
+      (is (= :buffer-def (:status doc-info)))
+      (is (= "calculate-total" (:name doc-info)))
+      (is (= 1 (:line doc-info)))
+      (is (= :def (:kind doc-info)))
+      (is (= "([subtotal tax-rate])" (:arglists doc-info)))
+      (is (= "Calculates the final total with tax." (:doc doc-info)))))
+
+  (testing "Lookup buffer defined symbol without docstring"
+    (let [code "(defn square [x] (* x x))\n"
+          doc-info (syntax/get-symbol-doc "square" code)]
+      (is (= :buffer-def (:status doc-info)))
+      (is (= "([x])" (:arglists doc-info)))
+      (is (nil? (:doc doc-info)))))
+
+  (testing "Lookup buffer defined multi-arity function"
+    (let [code "(defn greet\n  \"Greets a user.\"\n  ([name] (str \"Hello, \" name))\n  ([greeting name] (str greeting \", \" name)))\n"
+          doc-info (syntax/get-symbol-doc "greet" code)]
+      (is (= :buffer-def (:status doc-info)))
+      (is (= "([name] [greeting name])" (:arglists doc-info)))
+      (is (= "Greets a user." (:doc doc-info)))))
+
+  (testing "Lookup buffer def value (non-function)"
+    (let [code "(def default-timeout \"Default timeout in ms\" 5000)\n"
+          doc-info (syntax/get-symbol-doc "default-timeout" code)]
+      (is (= :buffer-def (:status doc-info)))
+      (is (nil? (:arglists doc-info)))
+      (is (= "Default timeout in ms" (:doc doc-info)))))
+
   (testing "Lookup unknown symbol returns not-found"
     (let [doc-info (syntax/get-symbol-doc "unknown-sym-xyz")]
-      (is (= :not-found (:status doc-info))))))
+      (is (= :not-found (:status doc-info)))))
+
+  (testing "format-autocomplete-doc output formatting"
+    (let [map-doc (syntax/get-symbol-doc "map")
+          let-doc (syntax/get-symbol-doc "let")
+          buf-code "(defn my-helper \"Does helper work\" [a b] (+ a b))"
+          buf-doc (syntax/get-symbol-doc "my-helper" buf-code)
+          buf-no-doc (syntax/get-symbol-doc "no-doc-fn" "(defn no-doc-fn [x] x)")
+          unknown-doc (syntax/get-symbol-doc "unknown-sym")]
+      ;; map
+      (let [fmt (syntax/format-autocomplete-doc map-doc {:symbol "map" :category :builtin})]
+        (is (.contains fmt "clojure.core/map"))
+        (is (.contains fmt "([f]"))
+        (is (.contains fmt "Returns a lazy sequence")))
+      ;; let
+      (let [fmt (syntax/format-autocomplete-doc let-doc {:symbol "let" :category :special})]
+        (is (.contains fmt "let  [special form]"))
+        (is (.contains fmt "let"))
+        (is (.contains fmt "bindings")))
+      ;; buffer with doc
+      (let [fmt (syntax/format-autocomplete-doc buf-doc {:symbol "my-helper" :category :user})]
+        (is (.contains fmt "my-helper  [buffer def, line 1]"))
+        (is (.contains fmt "([a b])"))
+        (is (.contains fmt "Does helper work")))
+      ;; buffer without doc
+      (let [fmt (syntax/format-autocomplete-doc buf-no-doc {:symbol "no-doc-fn" :category :user})]
+        (is (.contains fmt "no-doc-fn  [buffer def, line 1]"))
+        (is (.contains fmt "([x])"))
+        (is (.contains fmt "(No documentation string)")))
+      ;; unknown
+      (let [fmt (syntax/format-autocomplete-doc unknown-doc {:symbol "unknown-sym" :category :user})]
+        (is (.contains fmt "unknown-sym"))
+        (is (.contains fmt "(No documentation found)"))))))
 
 (deftest format-code-test
   (testing "Format unindented defn and let"

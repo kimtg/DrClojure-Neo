@@ -3,7 +3,7 @@
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
   (:import (java.awt.event KeyEvent)
-           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList)
+           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList JTextArea)
            (javax.swing.text DefaultStyledDocument)))
 
 (deftest app-metadata-test
@@ -569,7 +569,7 @@
                (.getText editor)))
         (is (= "Completed: calculate-surface-area" @status-msg)))))
 
-  (testing "Multiple matches creates popup list and selects first candidate"
+  (testing "Multiple matches creates popup list with real-time doc preview pane"
     (let [editor (JTextPane.)
           popup-atom (atom nil)
           status-msg (atom nil)
@@ -579,13 +579,58 @@
       (let [res (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)]
         (is (= :multi-match res))
         (is (some? @popup-atom))
-        (let [{:keys [list model]} @popup-atom]
+        (let [{:keys [list model doc-area]} @popup-atom]
           (is (> (.getSize model) 1))
-          (is (= 0 (.getSelectedIndex list))))
-        ;; Commit first candidate
+          (is (= 0 (.getSelectedIndex list)))
+          (is (instance? JTextArea doc-area))
+          ;; Initial docstring for first candidate (starts with "print" or "printf" or "println")
+          (let [first-cand (.getElementAt model 0)
+                first-doc (.getText ^JTextArea doc-area)]
+            (is (.contains first-doc (:symbol first-cand)))
+            (is (.contains first-doc "clojure.core/")))
+          ;; Move selection to index 1 and verify doc-area updates
+          (ui/move-popup-selection! popup-atom 1)
+          (let [second-cand (.getElementAt model 1)
+                second-doc (.getText ^JTextArea doc-area)]
+            (is (= 1 (.getSelectedIndex list)))
+            (is (.contains second-doc (:symbol second-cand)))))
+        ;; Commit candidate
         (ui/commit-autocomplete! popup-atom)
         (is (nil? @popup-atom))
         (is (.startsWith (.getText editor) "(pri")))))
+
+  (testing "Doc preview pane shows user-defined function docstring from buffer"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          code (str "(defn calculate-area\n"
+                    "  \"Calculates the area of a circle.\"\n"
+                    "  [r]\n"
+                    "  (* 3.14 r r))\n"
+                    "(defn calculate-volume\n"
+                    "  \"Calculates the volume of a sphere.\"\n"
+                    "  [r]\n"
+                    "  (* (/ 4.0 3.0) 3.14 r r r))\n"
+                    "(calc")]
+      (.setText editor code)
+      (.setCaretPosition editor (.length code))
+      (let [res (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)]
+        (is (= :multi-match res))
+        (is (some? @popup-atom))
+        (let [{:keys [list model doc-area]} @popup-atom]
+          (is (= 2 (.getSize model)))
+          (let [doc-text (.getText ^JTextArea doc-area)]
+            (is (.contains doc-text "calculate-area"))
+            (is (.contains doc-text "Calculates the area of a circle."))
+            (is (.contains doc-text "([r])")))
+          ;; Move down to calculate-volume
+          (ui/move-popup-selection! popup-atom 1)
+          (let [doc-text-2 (.getText ^JTextArea doc-area)]
+            (is (.contains doc-text-2 "calculate-volume"))
+            (is (.contains doc-text-2 "Calculates the volume of a sphere."))
+            (is (.contains doc-text-2 "([r])"))))
+        (ui/dismiss-autocomplete! popup-atom))))
 
   (testing "Zero matches reports no completions in status bar"
     (let [editor (JTextPane.)
@@ -608,6 +653,9 @@
       (.setCaretPosition editor 4)
       (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)
       (is (some? @popup-atom))
+      ;; Verify initial doc shows def documentation
+      (let [{:keys [doc-area]} @popup-atom]
+        (is (.contains (.getText ^JTextArea doc-area) "def  [special form]")))
       ;; Move down
       (ui/move-popup-selection! popup-atom 1)
       (is (= 1 (.getSelectedIndex ^JList (:list @popup-atom))))

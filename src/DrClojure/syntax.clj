@@ -269,6 +269,9 @@
   #{"def" "defn" "defn-" "defmacro" "defmulti" "defmethod" "defonce"
     "defprotocol" "defrecord" "deftype" "deftest" "defstruct" "definterface"})
 
+(def fn-def-forms
+  #{"defn" "defn-" "defmacro" "defmulti" "defmethod" "deftest" "fn" "fn*"})
+
 (defn line-number-at-offset
   "Calculates 1-based line number for character offset in `text`."
   [^String text offset]
@@ -443,16 +446,116 @@
         (conj! results [(.start matcher) (.end matcher)]))
       (persistent! results))))
 
+(defn extract-buffer-def-meta
+  "Inspects `text` around `def-target` (from `find-definition`) to extract
+   docstring and parameter list (arglists) if available.
+   Returns a map with `:arglists` and `:doc`."
+  [^String text def-target]
+  (when (and (string? text) def-target (= (:kind def-target) :def))
+    (try
+      (let [target-start (:start def-target)
+            tokens (vec (filter #(not= (first %) :comment) (tokenize text)))
+            n (count tokens)
+            bracket-info (compute-brackets text)
+            matches (:matches bracket-info)
+            sym-idx (loop [k 0]
+                      (when (< k n)
+                        (let [[_ s _] (nth tokens k)]
+                          (if (= s target-start)
+                            k
+                            (recur (inc k))))))]
+        (when sym-idx
+          ;; Look backward from sym-idx to identify the defining form (e.g. defn, def, etc.)
+          (let [defn-form-info (loop [k (dec sym-idx)]
+                                 (when (>= k 0)
+                                   (let [[tok s e] (nth tokens k)]
+                                     (cond
+                                       (= tok :metatag) (recur (dec k))
+                                       (def-forms (.substring text s e))
+                                       (when (> k 0)
+                                         (let [[prev-tok ps _] (nth tokens (dec k))]
+                                           (when (and (= prev-tok :bracket) (= (.charAt text ps) \())
+                                             {:form (.substring text s e)
+                                              :open-paren ps})))
+                                       :else nil))))
+                form-name (:form defn-form-info)
+                form-end (when-let [op (:open-paren defn-form-info)] (get matches op))
+                after-sym-tokens (take-while (fn [[_ s _]]
+                                               (if form-end (< s form-end) true))
+                                             (subvec tokens (inc sym-idx)))
+                ;; Drop leading metadata tags if any after symbol
+                meaningful-tokens (drop-while (fn [[t _ _]] (= t :metatag)) after-sym-tokens)]
+            (when (seq meaningful-tokens)
+              (let [[first-tok fs fe] (first meaningful-tokens)
+                    [doc-str remaining-tokens] (if (= first-tok :string)
+                                                 (let [raw (.substring text fs fe)
+                                                       cleaned (if (and (.startsWith raw "\"")
+                                                                        (.endsWith raw "\"")
+                                                                        (>= (.length raw) 2))
+                                                                 (subs raw 1 (dec (.length raw)))
+                                                                 raw)]
+                                                   [cleaned (rest meaningful-tokens)])
+                                                 [nil meaningful-tokens])
+                    rem-after-meta (drop-while (fn [[t _ _]] (= t :metatag)) remaining-tokens)]
+                ;; Parameter vector extraction only for function/macro defining forms
+                (if (and form-name (fn-def-forms form-name))
+                  (if-let [[next-tok ns ne] (first rem-after-meta)]
+                    (cond
+                      ;; Single arity: [x y ...]
+                      (and (= next-tok :bracket) (= (.charAt text ns) \[))
+                      (let [close-pos (get matches ns)
+                            args-vec (if close-pos
+                                       (.substring text ns (inc close-pos))
+                                       (.substring text ns ne))]
+                        {:doc doc-str
+                         :arglists (str "(" args-vec ")")})
+
+                      ;; Multi arity: ([x] ...) ([x y] ...)
+                      (and (= next-tok :bracket) (= (.charAt text ns) \())
+                      (let [arities (loop [toks rem-after-meta
+                                           acc []]
+                                      (if (empty? toks)
+                                        acc
+                                        (let [[t s _] (first toks)]
+                                          (if (and (= t :bracket) (= (.charAt text s) \())
+                                            (let [branch-close (get matches s)
+                                                  branch-toks (if branch-close
+                                                                (take-while (fn [[_ bs _]] (< bs branch-close)) (rest toks))
+                                                                (rest toks))
+                                                  first-vec (first (filter (fn [[bt bs _]]
+                                                                             (and (= bt :bracket) (= (.charAt text bs) \[)))
+                                                                           branch-toks))]
+                                              (if first-vec
+                                                (let [[_ vs _] first-vec
+                                                      vc (get matches vs)
+                                                      v-str (if vc (.substring text vs (inc vc)) "[]")]
+                                                  (recur (drop-while (fn [[_ bs _]] (if branch-close (<= bs branch-close) false)) toks)
+                                                         (conj acc v-str)))
+                                                (recur (rest toks) acc)))
+                                            (recur (rest toks) acc)))))]
+                        {:doc doc-str
+                         :arglists (when (seq arities) (str "(" (str/join " " arities) ")"))})
+
+                      :else
+                      {:doc doc-str :arglists nil})
+                    {:doc doc-str :arglists nil})
+                  ;; Non-function def forms (e.g. def, defonce)
+                  {:doc doc-str :arglists nil}))))))
+      (catch Exception _ nil))))
+
 (defn get-symbol-doc
   "Retrieves documentation and arglists for `sym-name`.
    Checks runtime environment first (resolving against clojure.core or loaded namespaces),
-   then checks definition within `text` if provided.
+   then Clojure special forms (via clojure.repl/special-doc),
+   then definition within `text` if provided.
    Returns a map with `:status` (:found, :buffer-def, :not-found) and metadata."
   [^String sym-name & [^String text pos]]
   (when-not (str/blank? sym-name)
     (let [sym (symbol sym-name)
           v (try (resolve sym) (catch Exception _ nil))]
-      (if v
+      (cond
+        ;; 1. Runtime Var resolved (built-ins, core functions, macros)
+        v
         (let [m (meta v)
               ns-str (str (or (:ns m) "clojure.core"))
               name-str (str (:name m))
@@ -470,13 +573,69 @@
            :macro? macro?
            :file file-str
            :line line-num})
+
+        ;; 2. Clojure special forms (def, if, do, recur, try, quote, var, set!, etc.)
+        (or (special-forms sym-name) (special-forms (str sym)))
+        (let [spec-info (try
+                          (require 'clojure.repl)
+                          (when-let [spec-fn (ns-resolve 'clojure.repl 'special-doc)]
+                            (@spec-fn sym))
+                          (catch Exception _ nil))]
+          (if spec-info
+            (let [forms (:forms spec-info)
+                  arglists (cond
+                             (seq forms) (str/join " " (map str forms))
+                             (:arglists spec-info) (str (:arglists spec-info))
+                             :else nil)]
+              {:status :found
+               :symbol sym-name
+               :name (str (or (:name spec-info) sym-name))
+               :special-form true
+               :arglists arglists
+               :doc (:doc spec-info)})
+            {:status :found
+             :symbol sym-name
+             :name sym-name
+             :special-form true}))
+
+        ;; 3. Buffer definition
+        :else
         (if-let [def-target (and text (find-definition text sym-name pos))]
-          {:status :buffer-def
-           :symbol sym-name
-           :line (:line def-target)
-           :kind (:kind def-target)}
+          (let [meta-info (extract-buffer-def-meta text def-target)]
+            {:status :buffer-def
+             :symbol sym-name
+             :name sym-name
+             :line (:line def-target)
+             :kind (:kind def-target)
+             :arglists (:arglists meta-info)
+             :doc (:doc meta-info)})
           {:status :not-found
            :symbol sym-name})))))
+
+(defn format-autocomplete-doc
+  "Formats documentation metadata returned by `get-symbol-doc` into a clean,
+   human-readable string for display in the autocomplete documentation preview."
+  [doc-info & [{:keys [category symbol]}]]
+  (if (or (nil? doc-info) (= (:status doc-info) :not-found))
+    (let [sym (or symbol (:symbol doc-info) "")]
+      (str sym "\n\n(No documentation found)"))
+    (let [{:keys [status ns name arglists doc line kind special-form macro?]} doc-info
+          sym-name (or name symbol (:symbol doc-info) "")
+          header (cond
+                   special-form (str sym-name "  [special form]")
+                   (= category :special) (str sym-name "  [special form]")
+                   macro? (str (if ns (str ns "/" sym-name) sym-name) "  [macro]")
+                   (= status :buffer-def) (str sym-name "  [buffer def" (if line (str ", line " line) "") "]")
+                   ns (str ns "/" sym-name)
+                   :else sym-name)
+          parts (transient [header])]
+      (when (and arglists (not (str/blank? arglists)))
+        (conj! parts (str "\n" arglists)))
+      (conj! parts "\n----------------------------------------\n")
+      (if (and doc (not (str/blank? doc)))
+        (conj! parts (str/trim doc))
+        (conj! parts "(No documentation string)"))
+      (apply str (persistent! parts)))))
 
 ;; --- Autocomplete Candidate & Prefix Extraction ---
 

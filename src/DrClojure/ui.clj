@@ -12,7 +12,7 @@
                         JFileChooser JOptionPane JToolBar BorderFactory Box
                         SwingUtilities UIManager JDialog JViewport JComponent JCheckBox AbstractAction
                         JList DefaultListModel DefaultListCellRenderer ListSelectionModel ScrollPaneConstants)
-           (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType)
+           (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType ListSelectionListener)
            (javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent
                              DefaultStyledDocument AbstractDocument$DefaultDocumentEvent)
            (java.awt BorderLayout FlowLayout GridLayout Dimension Font Color Insets
@@ -871,10 +871,20 @@
         (when status-fn (status-fn (str "Completed: " sym)))
         (.requestFocusInWindow editor)))))
 
+(defn- update-doc-preview! [^JTextArea doc-area candidate ^String text caret]
+  (when doc-area
+    (if candidate
+      (let [sym (:symbol candidate)
+            doc-info (syntax/get-symbol-doc sym text caret)
+            formatted (syntax/format-autocomplete-doc doc-info candidate)]
+        (.setText doc-area formatted)
+        (.setCaretPosition doc-area 0))
+      (.setText doc-area ""))))
+
 (defn move-popup-selection!
   "Moves selection index in active autocomplete popup list by `delta`."
   [active-popup-atom delta]
-  (when-let [{:keys [list model]} @active-popup-atom]
+  (when-let [{:keys [list model doc-area editor]} @active-popup-atom]
     (let [cnt (.getSize ^DefaultListModel model)
           cur (.getSelectedIndex ^JList list)
           next-idx (cond
@@ -882,12 +892,18 @@
                      :else (max 0 (min (dec cnt) (+ cur delta))))]
       (when (pos? cnt)
         (.setSelectedIndex ^JList list next-idx)
-        (.ensureIndexIsVisible ^JList list next-idx)))))
+        (.ensureIndexIsVisible ^JList list next-idx)
+        (when doc-area
+          (let [sel (.getSelectedValue ^JList list)
+                doc (.getDocument editor)
+                txt (.getText doc 0 (.getLength doc))
+                c (.getCaretPosition editor)]
+            (update-doc-preview! doc-area sel txt c)))))))
 
 (defn update-autocomplete-filter!
   "Dynamically updates candidates in the open popup as user continues typing or deletes."
   [active-popup-atom]
-  (when-let [{:keys [popup list model start editor]} @active-popup-atom]
+  (when-let [{:keys [popup list model doc-area start editor]} @active-popup-atom]
     (when (.isVisible ^JPopupMenu popup)
       (let [doc (.getDocument editor)
             text (.getText doc 0 (.getLength doc))
@@ -906,10 +922,13 @@
                     (doseq [c candidates]
                       (.addElement ^DefaultListModel model c))
                     (.setSelectedIndex ^JList list 0)
-                    (.ensureIndexIsVisible ^JList list 0)))))))))))
+                    (.ensureIndexIsVisible ^JList list 0)
+                    (when doc-area
+                      (update-doc-preview! doc-area (first candidates) text caret))))))))))))
 
 (defn show-autocomplete-popup!
-  "Builds and displays a scrollable completion popup beneath the caret in `editor`."
+  "Builds and displays a scrollable completion popup beneath the caret in `editor`.
+   Shows candidate list on the left and documentation preview on the right."
   [^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty!]
   (dismiss-autocomplete! active-popup-atom)
   (let [popup (JPopupMenu.)
@@ -921,11 +940,38 @@
         _ (.setSelectionMode list ListSelectionModel/SINGLE_SELECTION)
         _ (.setSelectedIndex list 0)
         _ (.setFocusable list false)
-        scroll (JScrollPane. list ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
-        _ (.setBorder scroll (BorderFactory/createEmptyBorder))
-        _ (.setPreferredSize scroll (Dimension. 240 180))
-        _ (.add popup scroll)
+        scroll-list (JScrollPane. list ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
+        _ (.setBorder scroll-list (BorderFactory/createMatteBorder 0 0 0 1 (Color. 220 220 220)))
+        _ (.setPreferredSize scroll-list (Dimension. 220 220))
+        doc-area (JTextArea.)
+        _ (.setEditable doc-area false)
+        _ (.setLineWrap doc-area true)
+        _ (.setWrapStyleWord doc-area true)
+        _ (.setFont doc-area (Font. "Consolas" Font/PLAIN 12))
+        _ (.setBackground doc-area (Color. 250 250 252))
+        _ (.setForeground doc-area (Color. 40 40 40))
+        _ (.setMargin doc-area (Insets. 6 8 6 8))
+        _ (.setFocusable doc-area false)
+        scroll-doc (JScrollPane. doc-area ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
+        _ (.setBorder scroll-doc (BorderFactory/createEmptyBorder))
+        _ (.setPreferredSize scroll-doc (Dimension. 400 220))
+        content-panel (JPanel. (BorderLayout.))
+        _ (.add content-panel scroll-list BorderLayout/WEST)
+        _ (.add content-panel scroll-doc BorderLayout/CENTER)
+        _ (.add popup content-panel)
         caret (.getCaretPosition editor)
+        doc (.getDocument editor)
+        text (.getText doc 0 (.getLength doc))
+        _ (update-doc-preview! doc-area (first candidates) text caret)
+        _ (.addListSelectionListener list
+            (reify ListSelectionListener
+              (valueChanged [this e]
+                (when-not (.getValueIsAdjusting e)
+                  (let [sel (.getSelectedValue list)
+                        cur-doc (.getDocument editor)
+                        cur-txt (.getText cur-doc 0 (.getLength cur-doc))
+                        cur-caret (.getCaretPosition editor)]
+                    (update-doc-preview! doc-area sel cur-txt cur-caret))))))
         r (try
             (if-let [rect (.modelToView2D editor (int caret))]
               rect
@@ -936,6 +982,7 @@
         state {:popup popup
                :list list
                :model model
+               :doc-area doc-area
                :start start
                :word-end word-end
                :status-fn status-fn
