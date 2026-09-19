@@ -13,7 +13,10 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 - **REPL Command History**: Navigate previous REPL commands in the prompt using `Up` and `Down` arrow keys.
 - **7-Level Rainbow Parentheses**: Cycles through 7 distinct, vibrant colors (Warm Amber, Royal Blue, Violet, Forest Green, Crimson, Teal, Rose) based on nesting depth `(mod depth 7)` across parentheses `()`, brackets `[]`, and braces `{}`, making nested Clojure code instantly readable. Mismatched or unclosed brackets are highlighted in bold red.
 - **Lexical-Aware Bracket Matching**: Highlights matching bracket pairs in warm amber when the caret is adjacent to any bracket. Fully token-aware: brackets inside comments, strings, regexes, and character literals are completely ignored.
-- **Smart Indentation**: Tab key inserts 2 spaces (standard Clojure indentation) and indents selections.
+- **Smart Block Indentation & Unindent**: `Tab` inserts 2 spaces and indents selected blocks; `Shift+Tab` unindents single lines or selected blocks by 2 spaces.
+- **Rename (Refactor) Symbol**: Press `Shift+F6` or `F2` to safely rename all occurrences of a symbol across the file (with lexical filtering preventing unintended replacements in comments or strings).
+- **Jump to Definition**: Press `F12` or `Ctrl+B` to instantly jump to top-level definitions (`defn`, `def`, `defmacro`, etc.) or local bindings, scroll into view, or inspect external Clojure Var definitions.
+- **Editor Context Menu**: Right-click anywhere in the editor for quick access to Jump to Definition, Rename Symbol, Indent, Unindent, Cut, Copy, and Paste.
 - **Clojure Syntax Highlighting**: Real-time syntax coloring for special forms, built-ins, constants, keywords, strings, characters, numbers, and comments.
 - **Undo / Redo with Dirty Tracking**: Standard `Ctrl+Z` / `Ctrl+Y` support with clean undo isolation and accurate `*` unsaved changes tracking that automatically restores clean state on undo.
 - **Flexible Editor Width**: Code editor dynamically fills the window width while enabling horizontal scrollbars only when lines exceed the pane width.
@@ -103,6 +106,9 @@ clj -M:test
 | `Ctrl + Z` | Undo |
 | `Ctrl + Y` / `Ctrl + Shift + Z` | Redo |
 | `Tab` | Insert 2 spaces / indent selection |
+| `Shift + Tab` | Unindent line or selected block |
+| `F12` / `Ctrl + B` | Jump to Definition |
+| `Shift + F6` / `F2` | Rename Symbol (Refactor) |
 | `Ctrl + =` / `Ctrl + -` | Zoom In / Zoom Out font |
 | `Ctrl + 0` | Reset font size |
 | `F1` | Open Clojure Cheatsheet in web browser |

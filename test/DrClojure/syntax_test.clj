@@ -186,3 +186,86 @@
         (is (= (Color. 220 0 0) (StyleConstants/getForeground attrs)))
         (is (true? (StyleConstants/isBold attrs)))))))
 
+(deftest symbol-at-pos-test
+  (let [code "(defn greet [name]\n  ; a comment\n  \"a string\"\n  (println name))"]
+    (testing "Extracting symbol under or adjacent to cursor"
+      (is (= "defn" (:symbol (syntax/symbol-at-pos code 2))))
+      (is (= "greet" (:symbol (syntax/symbol-at-pos code 7))))
+      (is (= "name" (:symbol (syntax/symbol-at-pos code 15))))
+      (is (= "println" (:symbol (syntax/symbol-at-pos code 50)))))
+
+    (testing "Cursor in comments or strings returns nil"
+      ;; Offset 23 is inside "; a comment"
+      (is (nil? (syntax/symbol-at-pos code 23)))
+      ;; Offset 37 is inside "\"a string\""
+      (is (nil? (syntax/symbol-at-pos code 37))))
+
+    (testing "Cursor at whitespace or boundary"
+      (is (nil? (syntax/symbol-at-pos "" 0)))
+      (is (nil? (syntax/symbol-at-pos nil 0))))))
+
+(deftest find-symbol-occurrences-test
+  (let [code (str "(defn count-items [items]\n"
+                  "  ; items in comment\n"
+                  "  (let [items (filter identity items)]\n"
+                  "    {:items items, :count (count items)}))\n")]
+    (testing "Finds only code symbol occurrences"
+      (let [occs (syntax/find-symbol-occurrences code "items")]
+        ;; Should find 4 occurrences in code:
+        ;; 1: [items] parameter
+        ;; 2: [items (filter ...)] binding
+        ;; 3: (filter identity items) argument
+        ;; 4: {:items items ...} value
+        ;; 5: (count items) argument
+        (is (= 5 (count occs)))
+        (doseq [[s e] occs]
+          (is (= "items" (.substring code s e))))))
+
+    (testing "Keyword with same name is not treated as symbol"
+      (let [occs (syntax/find-symbol-occurrences code ":items")]
+        (is (empty? occs))))
+
+    (testing "Non-existent symbol returns empty"
+      (is (empty? (syntax/find-symbol-occurrences code "non-existent"))))))
+
+(deftest find-definition-test
+  (let [code (str "(ns test.defs)\n"
+                  "(def ^:dynamic *timeout* 3000)\n"
+                  "(defn compute-area [width height]\n"
+                  "  (let [ratio 1.5]\n"
+                  "    (* width height ratio)))\n"
+                  "(defmacro with-timer [& body]\n"
+                  "  `(time ~@body))\n"
+                  "(compute-area 10 20)\n")]
+    (testing "Top-level defn definition"
+      (let [res (syntax/find-definition code "compute-area")]
+        (is (some? res))
+        (is (= "compute-area" (:symbol res)))
+        (is (= 3 (:line res)))
+        (is (= :def (:kind res)))))
+
+    (testing "Top-level def with metadata"
+      (let [res (syntax/find-definition code "*timeout*")]
+        (is (some? res))
+        (is (= "*timeout*" (:symbol res)))
+        (is (= 2 (:line res)))
+        (is (= :def (:kind res)))))
+
+    (testing "Top-level defmacro"
+      (let [res (syntax/find-definition code "with-timer")]
+        (is (some? res))
+        (is (= "with-timer" (:symbol res)))
+        (is (= 6 (:line res)))
+        (is (= :def (:kind res)))))
+
+    (testing "Local binding inside let"
+      (let [ratio-usage-pos (.indexOf code "ratio)))")
+            res (syntax/find-definition code "ratio" ratio-usage-pos)]
+        (is (some? res))
+        (is (= "ratio" (:symbol res)))
+        (is (= 4 (:line res)))
+        (is (= :local (:kind res)))))
+
+    (testing "Undefined symbol returns nil"
+      (is (nil? (syntax/find-definition code "unknown-symbol"))))))
+

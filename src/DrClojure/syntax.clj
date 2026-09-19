@@ -2,6 +2,7 @@
   "Syntax highlighting for Clojure code in DrClojure.
    Provides lexing/tokenization and Swing DefaultStyledDocument styling
    using pure Clojure and standard Java Swing."
+  (:require [clojure.string :as str])
   (:import (javax.swing Timer)
            (javax.swing.text DefaultStyledDocument SimpleAttributeSet StyleConstants JTextComponent)
            (javax.swing.event DocumentListener)
@@ -261,4 +262,102 @@
     {:timer timer
      :bracket-info binfo-atom
      :highlight-now! highlight-fn}))
+
+;; --- Symbol Analysis & Navigation ---
+
+(def def-forms
+  #{"def" "defn" "defn-" "defmacro" "defmulti" "defmethod" "defonce"
+    "defprotocol" "defrecord" "deftype" "deftest" "defstruct" "definterface"})
+
+(defn line-number-at-offset
+  "Calculates 1-based line number for character offset in `text`."
+  [^String text offset]
+  (if (or (nil? text) (not (pos? offset)))
+    1
+    (inc (count (re-seq #"\n" (.substring text 0 (min (.length text) (int offset))))))))
+
+(defn symbol-at-pos
+  "Returns a map `{:symbol str, :start int, :end int, :type keyword}` for the symbol
+   covering or immediately adjacent to `pos` in `text`.
+   Returns nil if caret is not on a code symbol."
+  [^String text pos]
+  (when (and (string? text) (pos? (.length text)))
+    (let [tokens (tokenize text)
+          sym-tokens (filter #(contains? #{:symbol :special-form :builtin :constant} (first %)) tokens)
+          pos (min (.length text) (max 0 (int pos)))]
+      (if-let [tok (or (first (filter (fn [[_ s e]] (<= s pos e)) sym-tokens))
+                       (when (pos? pos)
+                         (first (filter (fn [[_ s e]] (= e pos)) sym-tokens))))]
+        (let [[tok-type s e] tok]
+          {:symbol (.substring text s e)
+           :start s
+           :end e
+           :type tok-type})
+        nil))))
+
+(defn find-symbol-occurrences
+  "Returns a vector of `[start end]` positions for all occurrences of `sym-name`
+   as a code symbol in `text` (strictly excluding comments, strings, regexes, keywords, etc.)."
+  [^String text sym-name]
+  (when (and (string? text) (not (str/blank? sym-name)))
+    (let [tokens (tokenize text)]
+      (vec
+        (keep (fn [[tok-type s e]]
+                (when (and (contains? #{:symbol :special-form :builtin :constant} tok-type)
+                           (= (.substring text s e) sym-name))
+                  [s e]))
+              tokens)))))
+
+(defn find-definition
+  "Finds the definition position of `sym-name` in `text`.
+   Checks top-level `def*` forms first, then local bindings (parameters / let / loop)
+   prior to `pos` if provided.
+   Returns `{:symbol str, :start int, :end int, :line int, :kind keyword}` or nil."
+  [^String text sym-name & [pos]]
+  (when (and (string? text) (not (str/blank? sym-name)))
+    (let [tokens (vec (filter #(not= (first %) :comment) (tokenize text)))
+          n (count tokens)]
+      ;; 1. Search top-level def* forms
+      (or
+        (loop [i 0]
+          (if (< i n)
+            (let [[tok-type s _] (nth tokens i)]
+              (if (and (= tok-type :bracket) (= (.charAt text s) \())
+                (if (< (inc i) n)
+                  (let [[next-type next-s next-e] (nth tokens (inc i))
+                        sym-form (.substring text next-s next-e)]
+                    (if (def-forms sym-form)
+                      ;; Scan forward past metadata to find defined symbol
+                      (let [def-target (loop [j (+ i 2)]
+                                         (when (< j n)
+                                           (let [[t-type ts te] (nth tokens j)]
+                                             (cond
+                                               (= t-type :metatag) (recur (inc j))
+                                               (= t-type :symbol) (when (= (.substring text ts te) sym-name)
+                                                                    {:symbol sym-name
+                                                                     :start ts
+                                                                     :end te
+                                                                     :line (line-number-at-offset text ts)
+                                                                     :kind :def})
+                                               :else nil))))]
+                        (if def-target
+                          def-target
+                          (recur (inc i))))
+                      (recur (inc i))))
+                  (recur (inc i)))
+                (recur (inc i))))
+            nil))
+        ;; 2. Search local bindings if pos is provided
+        (when (number? pos)
+          (let [prior-tokens (filter (fn [[_ s _]] (< s pos)) tokens)]
+            (when-let [target (last (filter (fn [[tok-type s e]]
+                                              (and (= tok-type :symbol)
+                                                   (= (.substring text s e) sym-name)))
+                                            prior-tokens))]
+              (let [[_ s e] target]
+                {:symbol sym-name
+                 :start s
+                 :end e
+                 :line (line-number-at-offset text s)
+                 :kind :local}))))))))
 
