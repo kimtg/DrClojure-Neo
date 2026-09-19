@@ -301,3 +301,62 @@
     (testing "Undefined symbol returns nil"
       (is (nil? (syntax/find-definition code "unknown-symbol"))))))
 
+(deftest compute-smart-indent-test
+  (testing "Calculates indentation when unclosed brackets exist"
+    (let [code "(defn greet [name]\n"]
+      ;; Cursor right before newline (pos = 18)
+      (is (= "  " (syntax/compute-smart-indent code 18)))))
+
+  (testing "Carries forward base indentation and adds 2 spaces for nested forms"
+    (let [code "  (let [x 10\n"]
+      (is (= "    " (syntax/compute-smart-indent code 12)))))
+
+  (testing "Preserves existing indentation when all forms on line are closed"
+    (let [code "  (println \"hello\"))\n"]
+      (is (= "  " (syntax/compute-smart-indent code 20)))))
+
+  (testing "Handles blank or empty inputs"
+    (is (= "" (syntax/compute-smart-indent "" 0)))
+    (is (= "" (syntax/compute-smart-indent nil 0)))))
+
+(deftest find-text-matches-test
+  (let [code "apple Banana apple orange BANANA"]
+    (testing "Case-insensitive search"
+      (let [matches (syntax/find-text-matches code "banana")]
+        (is (= 2 (count matches)))
+        (is (= [[6 12] [26 32]] matches))))
+
+    (testing "Case-sensitive search"
+      (let [matches (syntax/find-text-matches code "Banana" {:case-sensitive? true})]
+        (is (= 1 (count matches)))
+        (is (= [[6 12]] matches))))
+
+    (testing "Empty or non-matching query"
+      (is (empty? (syntax/find-text-matches code "")))
+      (is (empty? (syntax/find-text-matches code "grape"))))))
+
+(deftest get-symbol-doc-test
+  (testing "Lookup core runtime function doc"
+    (let [doc-info (syntax/get-symbol-doc "map")]
+      (is (= :found (:status doc-info)))
+      (is (= "clojure.core" (:ns doc-info)))
+      (is (string? (:arglists doc-info)))
+      (is (.contains (:doc doc-info) "Returns a lazy sequence"))))
+
+  (testing "Lookup macro doc"
+    (let [doc-info (syntax/get-symbol-doc "defn")]
+      (is (= :found (:status doc-info)))
+      (is (true? (:macro? doc-info)))))
+
+  (testing "Lookup buffer defined symbol"
+    (let [code "(defn my-custom-func [a b] (+ a b))\n"
+          doc-info (syntax/get-symbol-doc "my-custom-func" code)]
+      (is (= :buffer-def (:status doc-info)))
+      (is (= 1 (:line doc-info)))
+      (is (= :def (:kind doc-info)))))
+
+  (testing "Lookup unknown symbol returns not-found"
+    (let [doc-info (syntax/get-symbol-doc "unknown-sym-xyz")]
+      (is (= :not-found (:status doc-info))))))
+
+

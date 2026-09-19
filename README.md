@@ -11,12 +11,17 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 - **GUI Standard Input (`stdin`)**: Interactive console input (`read-line`) is processed directly within the GUI prompt with automatic focus and status indication.
 - **Asynchronous Execution & Stop Button**: Long-running loops or calculations run off the UI thread and can be safely interrupted at any time via the **Stop** button or `Escape`.
 - **REPL Command History**: Navigate previous REPL commands in the prompt using `Up` and `Down` arrow keys.
+- **In-Editor Find & Replace**: Press `Ctrl+F` (or `Ctrl+H` / `Ctrl+R` for Replace) to toggle the docked search bar. Features live match count ("X of Y"), case-sensitivity toggle, `F3` / `Shift+F3` navigation, and single or Replace-All replacements.
+- **Smart Auto-Indent on Enter**: Pressing `Enter` in the editor automatically carries forward the base indentation and indents 2 spaces when forms or brackets remain open.
+- **Toggle Line Comment**: Press `Ctrl+/` or `Ctrl+;` to instantly toggle line comments (`; `) on the current line or selected multi-line blocks while preserving empty lines.
+- **Quick Symbol Documentation**: Press `Ctrl+Q` or `Shift+F1` on any symbol to view its namespace, arglists, docstring, and source location in a non-modal monospace popup.
+- **Delimiter Auto-Closing & Selection Wrapping**: Automatically inserts closing delimiters for `()`, `[]`, `{}`, and `""`, wraps selected text when typing an open delimiter, supports stepping over closing delimiters, and deletes matching pairs on backspace.
 - **7-Level Rainbow Parentheses**: Cycles through 7 distinct, vibrant colors (Warm Amber, Royal Blue, Violet, Forest Green, Crimson, Teal, Rose) based on nesting depth `(mod depth 7)` across parentheses `()`, brackets `[]`, and braces `{}`, making nested Clojure code instantly readable. Mismatched or unclosed brackets are highlighted in bold red.
 - **Lexical-Aware Bracket Matching**: Highlights matching bracket pairs in warm amber when the caret is adjacent to any bracket. Fully token-aware: brackets inside comments, strings, regexes, and character literals are completely ignored.
 - **Smart Block Indentation & Unindent**: `Tab` inserts 2 spaces and indents selected blocks; `Shift+Tab` unindents single lines or selected blocks by 2 spaces.
 - **Rename (Refactor) Symbol**: Press `Shift+F6` or `F2` to safely rename all occurrences of a symbol across the file (with lexical filtering preventing unintended replacements in comments or strings).
 - **Jump to Definition**: Press `F12` or `Ctrl+B` to instantly jump to top-level definitions (`defn`, `def`, `defmacro`, etc.) or local bindings, scroll into view, or inspect external Clojure Var definitions.
-- **Editor Context Menu**: Right-click anywhere in the editor for quick access to Jump to Definition, Rename Symbol, Indent, Unindent, Cut, Copy, and Paste.
+- **Editor Context Menu**: Right-click anywhere in the editor for quick access to Jump to Definition, Rename Symbol, Quick Documentation, Toggle Comment, Indent, Unindent, Find, Replace, Cut, Copy, and Paste.
 - **Clojure Syntax Highlighting**: Real-time syntax coloring for special forms, built-ins, constants, keywords, strings, characters, numbers, and comments.
 - **Undo / Redo with Dirty Tracking**: Standard `Ctrl+Z` / `Ctrl+Y` support with clean undo isolation and accurate `*` unsaved changes tracking that automatically restores clean state on undo.
 - **Flexible Editor Width**: Code editor dynamically fills the window width while enabling horizontal scrollbars only when lines exceed the pane width.
@@ -95,9 +100,17 @@ clj -M:test
 
 | Shortcut | Action |
 | :--- | :--- |
-| `Ctrl + Enter` / `F5` | Run Definitions (execute code in editor) |
+| `F5` | Run Definitions (execute code in editor) |
 | `Ctrl + E` | Run Selected text or current line |
-| `Escape` | Stop actively running evaluation |
+| `Escape` | Close find bar (if open) / Stop running evaluation |
+| `Ctrl + F` | Open Find panel |
+| `Ctrl + H` / `Ctrl + R` | Open Replace panel |
+| `F3` / `Shift + F3` | Find Next / Find Previous match |
+| `Enter` | Smart auto-indent (preserves base + 2 spaces for open forms) |
+| `Ctrl + /` / `Ctrl + ;` | Toggle Line Comment (`; `) on line or selection |
+| `Ctrl + Q` / `Shift + F1` | Quick Symbol Documentation (docstring, arglists, source) |
+| `(` `[` `{` `"` | Auto-close delimiter / wrap selection |
+| `Backspace` | Delete paired delimiters together |
 | `Ctrl + L` | Clear Output / reset console |
 | `Ctrl + S` | Save file |
 | `Ctrl + Shift + S` | Save As... |

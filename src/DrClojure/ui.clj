@@ -10,11 +10,11 @@
   (:import (javax.swing JFrame JPanel JSplitPane JScrollPane JTextArea JTextField JTextPane
                         JButton JLabel JMenuBar JMenu JMenuItem JPopupMenu KeyStroke
                         JFileChooser JOptionPane JToolBar BorderFactory Box
-                        SwingUtilities UIManager JDialog JViewport)
+                        SwingUtilities UIManager JDialog JViewport JComponent JCheckBox AbstractAction)
            (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType)
            (javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent
                              DefaultStyledDocument AbstractDocument$DefaultDocumentEvent)
-           (java.awt BorderLayout FlowLayout Dimension Font Color Insets
+           (java.awt BorderLayout FlowLayout GridLayout Dimension Font Color Insets
                      KeyboardFocusManager Toolkit Desktop Desktop$Action)
            (java.net URI)
            (java.awt.event ActionEvent ActionListener KeyEvent KeyAdapter
@@ -176,28 +176,197 @@
           (.setSelectionStart editor new-start)
           (.setSelectionEnd editor new-end))))))
 
-(defn setup-tab-key! [^JTextComponent editor]
+;; --- Toggle Comment ---
+
+(defn toggle-comment!
+  "Comments or uncomments the current line or selected lines by toggling '; ' at the start of lines."
+  [^JTextComponent editor]
+  (let [doc (.getDocument editor)
+        root (.getDefaultRootElement doc)
+        sel-start (.getSelectionStart editor)
+        sel-end (.getSelectionEnd editor)
+        start-line (.getElementIndex root sel-start)
+        end-line (.getElementIndex root (if (and (> sel-end sel-start)
+                                                (= sel-end (.getStartOffset (.getElement root (.getElementIndex root sel-end)))))
+                                          (dec sel-end)
+                                          sel-end))
+        lines (range start-line (inc end-line))
+        non-empty-lines (filter (fn [idx]
+                                  (let [elem (.getElement root idx)
+                                        s (.getStartOffset elem)
+                                        e (.getEndOffset elem)
+                                        t (.getText doc s (- e s))]
+                                    (not (str/blank? t))))
+                                lines)
+        all-commented? (and (seq non-empty-lines)
+                            (every? (fn [line-idx]
+                                      (let [elem (.getElement root line-idx)
+                                            s (.getStartOffset elem)
+                                            e (.getEndOffset elem)
+                                            t (.getText doc s (- e s))]
+                                        (boolean (re-find #"^[ ]*;+" t))))
+                                    non-empty-lines))]
+    (if all-commented?
+      ;; Uncomment: remove '; ' or ';'
+      (doseq [line-idx (reverse lines)]
+        (let [elem (.getElement root line-idx)
+              s (.getStartOffset elem)
+              e (.getEndOffset elem)
+              t (.getText doc s (- e s))]
+          (when-let [m (re-find #"^([ ]*)(;+[ ]?)" t)]
+            (let [leading-spaces (count (nth m 1))
+                  comment-chars (count (nth m 2))]
+              (.remove doc (+ s leading-spaces) comment-chars)))))
+      ;; Comment: add '; ' at the start of each line
+      (doseq [line-idx (reverse lines)]
+        (let [elem (.getElement root line-idx)
+              s (.getStartOffset elem)
+              e (.getEndOffset elem)
+              t (.getText doc s (- e s))]
+          (when-not (str/blank? t)
+            (.insertString doc s "; " nil)))))))
+
+;; --- Smart Auto-Indent on Enter ---
+
+(defn handle-smart-enter!
+  "Inserts a newline and auto-computes the appropriate indentation spaces based on open Clojure forms."
+  [^JTextComponent editor]
+  (let [doc (.getDocument editor)
+        sel-start (.getSelectionStart editor)
+        sel-end (.getSelectionEnd editor)]
+    (when (> sel-end sel-start)
+      (.remove doc sel-start (- sel-end sel-start))
+      (.setCaretPosition editor sel-start))
+    (let [pos (.getCaretPosition editor)
+          text (.getText doc 0 (.getLength doc))
+          indent (syntax/compute-smart-indent text pos)
+          insert-str (str "\n" indent)]
+      (.insertString doc pos insert-str nil)
+      (.setCaretPosition editor (+ pos (count insert-str))))))
+
+;; --- Auto-Closing Delimiters & Selection Wrapping ---
+
+(def open->matching-close
+  {\( \), \[ \], \{ \}, \" \"})
+
+(def close-delimiters
+  #{\) \] \} \"})
+
+(defn setup-auto-brackets!
+  "Attaches key listener to editor for auto-closing brackets, delimiter wrapping of selections,
+   step-over closing delimiters, and paired backspace deletion."
+  [^JTextComponent editor]
+  (.addKeyListener editor
+    (proxy [KeyAdapter] []
+      (keyTyped [^KeyEvent e]
+        (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
+          (let [ch (.getKeyChar e)]
+            (cond
+              ;; 1. Open delimiter: wrap selection or insert pair
+              (contains? open->matching-close ch)
+              (let [doc (.getDocument editor)
+                    sel-start (.getSelectionStart editor)
+                    sel-end (.getSelectionEnd editor)
+                    close-ch (open->matching-close ch)]
+                (if (> sel-end sel-start)
+                  ;; Wrap selection
+                  (let [sel-text (.getSelectedText editor)
+                        wrapped (str ch sel-text close-ch)]
+                    (.consume e)
+                    (.remove doc sel-start (- sel-end sel-start))
+                    (.insertString doc sel-start wrapped nil)
+                    (.setSelectionStart editor sel-start)
+                    (.setSelectionEnd editor (+ sel-start (count wrapped))))
+                  ;; No selection
+                  (let [caret (.getCaretPosition editor)
+                        doc-len (.getLength doc)
+                        next-ch (when (< caret doc-len) (.charAt (.getText doc caret 1) 0))]
+                    (if (and (= ch \") (= next-ch \"))
+                      ;; Step over existing quote
+                      (do
+                        (.consume e)
+                        (.setCaretPosition editor (inc caret)))
+                      ;; Insert pair
+                      (do
+                        (.consume e)
+                        (.insertString doc caret (str ch close-ch) nil)
+                        (.setCaretPosition editor (inc caret)))))))
+
+              ;; 2. Close delimiter: step-over if next character matches
+              (contains? close-delimiters ch)
+              (let [sel-start (.getSelectionStart editor)
+                    sel-end (.getSelectionEnd editor)]
+                (when (= sel-start sel-end)
+                  (let [doc (.getDocument editor)
+                        caret (.getCaretPosition editor)
+                        doc-len (.getLength doc)]
+                    (when (< caret doc-len)
+                      (let [next-ch (.charAt (.getText doc caret 1) 0)]
+                        (when (= ch next-ch)
+                          (.consume e)
+                          (.setCaretPosition editor (inc caret))))))))
+
+              :else nil))))
+
+      (keyPressed [^KeyEvent e]
+        (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
+          ;; 3. Paired Backspace deletion
+          (when (= (.getKeyCode e) KeyEvent/VK_BACK_SPACE)
+            (let [sel-start (.getSelectionStart editor)
+                  sel-end (.getSelectionEnd editor)]
+              (when (= sel-start sel-end)
+                (let [caret (.getCaretPosition editor)
+                      doc (.getDocument editor)
+                      doc-len (.getLength doc)]
+                  (when (and (pos? caret) (< caret doc-len))
+                    (let [prev-ch (.charAt (.getText doc (dec caret) 1) 0)
+                          next-ch (.charAt (.getText doc caret 1) 0)]
+                      (when (= (open->matching-close prev-ch) next-ch)
+                        (.consume e)
+                        (.remove doc (dec caret) 2)
+                        (.setCaretPosition editor (dec caret))))))))))))))
+
+(defn setup-editor-keys!
+  [^JTextComponent editor toggle-comment-fn!]
   (.setFocusTraversalKeys editor KeyboardFocusManager/FORWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
   (.setFocusTraversalKeys editor KeyboardFocusManager/BACKWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
   (let [im (.getInputMap editor)
         am (.getActionMap editor)]
+    ;; Tab / Shift+Tab
     (.put im (KeyStroke/getKeyStroke "TAB") "block-indent")
     (.put am "block-indent"
-      (proxy [javax.swing.AbstractAction] []
+      (proxy [AbstractAction] []
         (actionPerformed [e]
           (indent-selection! editor))))
     (.put im (KeyStroke/getKeyStroke "shift TAB") "block-unindent")
     (.put im (KeyStroke/getKeyStroke KeyEvent/VK_TAB KeyEvent/SHIFT_DOWN_MASK) "block-unindent")
     (.put am "block-unindent"
-      (proxy [javax.swing.AbstractAction] []
+      (proxy [AbstractAction] []
         (actionPerformed [e]
-          (unindent-selection! editor))))))
+          (unindent-selection! editor))))
+
+    ;; Smart Enter
+    (.put im (KeyStroke/getKeyStroke "ENTER") "smart-enter")
+    (.put am "smart-enter"
+      (proxy [AbstractAction] []
+        (actionPerformed [e]
+          (handle-smart-enter! editor))))
+
+    ;; Toggle Comment (Ctrl+/ and Ctrl+;)
+    (.put im (KeyStroke/getKeyStroke "control SLASH") "toggle-comment")
+    (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SLASH KeyEvent/CTRL_DOWN_MASK) "toggle-comment")
+    (.put im (KeyStroke/getKeyStroke "control SEMICOLON") "toggle-comment")
+    (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SEMICOLON KeyEvent/CTRL_DOWN_MASK) "toggle-comment")
+    (.put am "toggle-comment"
+      (proxy [AbstractAction] []
+        (actionPerformed [e]
+          (toggle-comment-fn!))))))
 
 (defn jump-to-definition!
-  "Jumps to definition of the symbol under cursor/selection in the source editor.
+  "Jumps to definition of the symbol under cursor/selection in the source editor without modifying status bar.
    If defined in current buffer, moves caret, selects symbol, and scrolls into view.
    If external Var, displays definition info dialog with namespace, file, and arglists."
-  [^JFrame frame ^JTextComponent editor set-status!]
+  [^JFrame frame ^JTextComponent editor & [_set-status!]]
   (let [doc (.getDocument editor)
         text (.getText doc 0 (.getLength doc))
         sel (.getSelectedText editor)
@@ -206,18 +375,16 @@
                    {:symbol (str/trim sel) :start (.getSelectionStart editor) :end (.getSelectionEnd editor)}
                    (syntax/symbol-at-pos text caret))]
     (if-not sym-info
-      (do
-        (set-status! "No symbol at cursor to find definition.")
-        (.. Toolkit getDefaultToolkit beep))
+      (.. Toolkit getDefaultToolkit beep)
       (let [sym-name (:symbol sym-info)
             def-target (syntax/find-definition text sym-name caret)]
         (if def-target
           (let [start-pos (:start def-target)
-                end-pos (:end def-target)
                 line-num (:line def-target)]
+            ;; Position caret at start of symbol without selecting (prevents accidental deletion on typing)
             (.setCaretPosition editor (int start-pos))
             (.setSelectionStart editor (int start-pos))
-            (.setSelectionEnd editor (int end-pos))
+            (.setSelectionEnd editor (int start-pos))
             (try
               (if-let [rect (.modelToView2D editor (int start-pos))]
                 (.scrollRectToVisible editor (.getBounds rect))
@@ -227,8 +394,7 @@
                       line-start (.getStartOffset elem)]
                   (.scrollRectToVisible editor (java.awt.Rectangle. 0 (int (* line-idx 18)) 1 1))))
               (catch Exception _ nil))
-            (.requestFocusInWindow editor)
-            (set-status! (str "Jumped to definition of '" sym-name "' (line " line-num ")")))
+            (.requestFocusInWindow editor))
           ;; Search runtime Var if not found in current buffer
           (let [sym (symbol sym-name)
                 v (try (resolve sym) (catch Exception _ nil))]
@@ -245,14 +411,11 @@
                 (when file-str (.append msg-sb (str "Defined in: " file-str (when line-num (str ":" line-num)) "\n")))
                 (when arglists (.append msg-sb (str "Arglists: " arglists "\n\n")))
                 (when doc-str (.append msg-sb (str "Documentation:\n" doc-str "\n")))
-                (set-status! (str "External definition: " ns-str "/" name-str (when line-num (str " (line " line-num ")"))))
                 (JOptionPane/showMessageDialog frame (str msg-sb) (str "Definition: " ns-str "/" name-str) JOptionPane/INFORMATION_MESSAGE))
-              (do
-                (set-status! (str "Definition not found for '" sym-name "'"))
-                (JOptionPane/showMessageDialog frame
-                  (str "Could not find definition for '" sym-name "' in current file or loaded namespaces.")
-                  "Jump to Definition"
-                  JOptionPane/INFORMATION_MESSAGE)))))))))
+              (JOptionPane/showMessageDialog frame
+                (str "Could not find definition for '" sym-name "' in current file or loaded namespaces.")
+                "Jump to Definition"
+                JOptionPane/INFORMATION_MESSAGE))))))))
 
 (defn rename-symbol-dialog!
   "Prompts user for a new symbol name and renames all occurrences of the symbol
@@ -308,29 +471,328 @@
                       (set-status! msg)
                       (JOptionPane/showMessageDialog frame msg "Rename Complete" JOptionPane/INFORMATION_MESSAGE))))))))))))
 
+;; --- Quick Documentation ---
+
+(defn show-doc-dialog!
+  "Displays documentation in a clean monospace dialog."
+  [^JFrame frame ^String content ^String title]
+  (let [dialog (JDialog. frame title false)
+        text-area (JTextArea. 16 56)
+        _ (do (.setText text-area content)
+              (.setEditable text-area false)
+              (.setCaretPosition text-area 0)
+              (.setFont text-area (Font. "Consolas" Font/PLAIN 13))
+              (.setBackground text-area (Color. 250 250 250))
+              (.setBorder text-area (BorderFactory/createEmptyBorder 8 10 8 10)))
+        scroll (JScrollPane. text-area)
+        btn-close (JButton. "Close")
+        _ (.addActionListener btn-close
+            (proxy [ActionListener] []
+              (actionPerformed [e]
+                (.dispose dialog))))
+        btn-panel (JPanel. (FlowLayout. FlowLayout/RIGHT))
+        _ (.add btn-panel btn-close)
+        content-pane (.getContentPane dialog)]
+    (.setLayout content-pane (BorderLayout. 0 4))
+    (.add content-pane scroll BorderLayout/CENTER)
+    (.add content-pane btn-panel BorderLayout/SOUTH)
+    (.. dialog getRootPane (setDefaultButton btn-close))
+    (.. dialog getRootPane (getInputMap JComponent/WHEN_IN_FOCUSED_WINDOW)
+        (put (KeyStroke/getKeyStroke "ESCAPE") "close-dialog"))
+    (.. dialog getRootPane (getActionMap)
+        (put "close-dialog"
+          (proxy [AbstractAction] []
+            (actionPerformed [e]
+              (.dispose dialog)))))
+    (.pack dialog)
+    (when frame (.setLocationRelativeTo dialog frame))
+    (.setVisible dialog true)))
+
+(defn show-quick-doc!
+  "Shows quick documentation and arglists for the symbol under the cursor without modifying the status bar."
+  [^JFrame frame ^JTextComponent editor & [_set-status!]]
+  (let [doc (.getDocument editor)
+        text (.getText doc 0 (.getLength doc))
+        caret (.getCaretPosition editor)
+        sel (.getSelectedText editor)
+        sym-info (if (and (not (str/blank? sel)) (re-matches #"^[-_a-zA-Z0-9\p{L}\p{N}.!$%&*+/<=>?#]+$" (str/trim sel)))
+                   {:symbol (str/trim sel)}
+                   (syntax/symbol-at-pos text caret))]
+    (if-not sym-info
+      (JOptionPane/showMessageDialog frame
+        "No symbol at cursor to inspect documentation."
+        "Quick Documentation"
+        JOptionPane/INFORMATION_MESSAGE)
+      (let [sym-name (:symbol sym-info)
+            doc-info (syntax/get-symbol-doc sym-name text caret)]
+        (case (:status doc-info)
+          :found
+          (let [msg-sb (StringBuilder.)]
+            (.append msg-sb (str "Symbol: " (:ns doc-info) "/" (:name doc-info) "\n"))
+            (when (:macro? doc-info)
+              (.append msg-sb "Type: Macro\n"))
+            (when-let [args (:arglists doc-info)]
+              (.append msg-sb (str "Arglists: " args "\n\n")))
+            (if-let [d (:doc doc-info)]
+              (.append msg-sb (str "Documentation:\n" d "\n\n"))
+              (.append msg-sb "Documentation: (Not documented)\n\n"))
+            (when-let [f (:file doc-info)]
+              (.append msg-sb (str "Source: " f (when-let [l (:line doc-info)] (str ":" l)))))
+            (show-doc-dialog! frame (str msg-sb) (str "Doc: " (:ns doc-info) "/" (:name doc-info))))
+
+          :buffer-def
+          (let [msg (str "Symbol: " sym-name "\n\n"
+                         "Defined locally in this buffer at line " (:line doc-info) " (" (name (:kind doc-info)) ").")]
+            (show-doc-dialog! frame msg (str "Definition: " sym-name)))
+
+          :not-found
+          (JOptionPane/showMessageDialog frame
+            (str "No documentation found for symbol '" sym-name "'.")
+            "Quick Documentation"
+            JOptionPane/INFORMATION_MESSAGE))))))
+
+;; --- In-Editor Find & Replace Panel ---
+
+(defn create-find-replace-panel
+  "Creates an inline, dockable Find & Replace panel for the editor."
+  [^JTextComponent editor highlight-now! update-title! set-status!]
+  (let [panel (JPanel. (BorderLayout. 4 2))
+        _ (.setBorder panel (BorderFactory/createCompoundBorder
+                              (BorderFactory/createMatteBorder 1 0 0 0 (Color. 210 210 210))
+                              (BorderFactory/createEmptyBorder 4 6 4 6)))
+        _ (.setBackground panel (Color. 248 248 248))
+
+        find-field (JTextField. 16)
+        replace-field (JTextField. 16)
+        match-label (JLabel. "No matches")
+        _ (.setForeground match-label (Color. 120 120 120))
+        match-case-cb (JCheckBox. "Match Case")
+        _ (.setBackground match-case-cb (Color. 248 248 248))
+
+        btn-prev (JButton. "▲ Prev")
+        btn-next (JButton. "▼ Next")
+        btn-replace (JButton. "Replace")
+        btn-replace-all (JButton. "Replace All")
+        btn-close (JButton. "✕")
+        _ (.setMargin btn-close (Insets. 0 4 0 4))
+        _ (.setFocusable btn-close false)
+
+        matches-atom (atom [])
+        cur-idx-atom (atom -1)
+
+        select-match! (fn [idx]
+                        (let [matches @matches-atom
+                              total (count matches)]
+                          (when (and (pos? total) (<= 0 idx (dec total)))
+                            (reset! cur-idx-atom idx)
+                            (let [[s e] (nth matches idx)]
+                              (.setCaretPosition editor (int s))
+                              (.setSelectionStart editor (int s))
+                              (.setSelectionEnd editor (int e))
+                              (try
+                                (if-let [rect (.modelToView2D editor (int s))]
+                                  (.scrollRectToVisible editor (.getBounds rect)))
+                                (catch Exception _ nil)))
+                            (.setText match-label (str (inc idx) " of " total)))))
+
+        update-matches! (fn []
+                          (let [doc (.getDocument editor)
+                                text (.getText doc 0 (.getLength doc))
+                                query (.getText find-field)
+                                case? (.isSelected match-case-cb)
+                                matches (if (str/blank? query)
+                                          []
+                                          (syntax/find-text-matches text query {:case-sensitive? case?}))
+                                total (count matches)]
+                            (reset! matches-atom matches)
+                            (if (zero? total)
+                              (do
+                                (reset! cur-idx-atom -1)
+                                (.setText match-label "No matches"))
+                              (let [caret (.getCaretPosition editor)
+                                    idx (or (first (keep-indexed (fn [i [s e]] (when (<= s caret e) i)) matches))
+                                            (first (keep-indexed (fn [i [s _]] (when (>= s caret) i)) matches))
+                                            0)]
+                                (select-match! idx)))))
+
+        find-next! (fn []
+                     (update-matches!)
+                     (let [matches @matches-atom
+                           total (count matches)]
+                       (when (pos? total)
+                         (let [next-idx (mod (inc @cur-idx-atom) total)]
+                           (select-match! next-idx)))))
+
+        find-prev! (fn []
+                     (update-matches!)
+                     (let [matches @matches-atom
+                           total (count matches)]
+                       (when (pos? total)
+                         (let [prev-idx (mod (dec @cur-idx-atom) total)]
+                           (select-match! prev-idx)))))
+
+        replace-current! (fn []
+                           (let [matches @matches-atom
+                                 cur-idx @cur-idx-atom]
+                             (when (and (pos? (count matches)) (<= 0 cur-idx (dec (count matches))))
+                               (let [[s e] (nth matches cur-idx)
+                                     rep-text (.getText replace-field)
+                                     doc (.getDocument editor)]
+                                 (when (and (= (.getSelectionStart editor) s)
+                                            (= (.getSelectionEnd editor) e))
+                                   (.remove doc (int s) (int (- e s)))
+                                   (.insertString doc (int s) rep-text nil)
+                                   (highlight-now!)
+                                   (update-title!)
+                                   (update-matches!)
+                                   (when (pos? (count @matches-atom))
+                                     (let [next-idx (min @cur-idx-atom (dec (count @matches-atom)))]
+                                       (select-match! next-idx))))))))
+
+        replace-all! (fn []
+                       (let [doc (.getDocument editor)
+                             text (.getText doc 0 (.getLength doc))
+                             query (.getText find-field)
+                             rep-text (.getText replace-field)
+                             case? (.isSelected match-case-cb)
+                             matches (syntax/find-text-matches text query {:case-sensitive? case?})
+                             total (count matches)]
+                         (if (zero? total)
+                           (set-status! "No matches found to replace.")
+                           (do
+                             (doseq [[s e] (reverse matches)]
+                               (.remove doc (int s) (int (- e s)))
+                               (.insertString doc (int s) rep-text nil))
+                             (highlight-now!)
+                             (update-title!)
+                             (update-matches!)
+                             (let [msg (str "Replaced " total " occurrence" (when (> total 1) "s") ".")]
+                               (set-status! msg)
+                               (.setText match-label msg))))))
+
+        close-panel! (fn []
+                       (.setVisible panel false)
+                       (.requestFocusInWindow editor))
+
+        open-find! (fn []
+                     (let [sel (.getSelectedText editor)]
+                       (when-not (str/blank? sel)
+                         (.setText find-field (str/trim sel))))
+                     (.setVisible panel true)
+                     (.requestFocusInWindow find-field)
+                     (.selectAll find-field)
+                     (update-matches!))
+
+        open-replace! (fn []
+                        (open-find!)
+                        (.requestFocusInWindow replace-field)
+                        (.selectAll replace-field))]
+
+    ;; Action listeners
+    (.addActionListener btn-next (proxy [ActionListener] [] (actionPerformed [e] (find-next!))))
+    (.addActionListener btn-prev (proxy [ActionListener] [] (actionPerformed [e] (find-prev!))))
+    (.addActionListener btn-replace (proxy [ActionListener] [] (actionPerformed [e] (replace-current!))))
+    (.addActionListener btn-replace-all (proxy [ActionListener] [] (actionPerformed [e] (replace-all!))))
+    (.addActionListener btn-close (proxy [ActionListener] [] (actionPerformed [e] (close-panel!))))
+    (.addActionListener match-case-cb (proxy [ActionListener] [] (actionPerformed [e] (update-matches!))))
+
+    ;; Enter / Shift+Enter in find-field
+    (.addActionListener find-field
+      (proxy [ActionListener] []
+        (actionPerformed [e]
+          (find-next!))))
+
+    ;; Real-time search update on typing
+    (.. find-field getDocument (addDocumentListener
+      (proxy [DocumentListener] []
+        (insertUpdate [e] (update-matches!))
+        (removeUpdate [e] (update-matches!))
+        (changedUpdate [e] (update-matches!)))))
+
+    ;; Escape in find & replace fields closes panel
+    (doseq [field [find-field replace-field]]
+      (let [im (.getInputMap field JComponent/WHEN_FOCUSED)
+            am (.getActionMap field)]
+        (.put im (KeyStroke/getKeyStroke "ESCAPE") "close-find")
+        (.put am "close-find" (proxy [AbstractAction] [] (actionPerformed [e] (close-panel!))))
+        (.put im (KeyStroke/getKeyStroke "shift ENTER") "prev-match")
+        (.put am "prev-match" (proxy [AbstractAction] [] (actionPerformed [e] (find-prev!))))))
+
+    ;; Assemble Rows
+    (let [row1 (JPanel. (FlowLayout. FlowLayout/LEFT 4 1))
+          _ (.setBackground row1 (Color. 248 248 248))
+          lbl-find (JLabel. "Find:")
+          _ (.setFont lbl-find (Font. "SansSerif" Font/PLAIN 12))
+          row2 (JPanel. (FlowLayout. FlowLayout/LEFT 4 1))
+          _ (.setBackground row2 (Color. 248 248 248))
+          lbl-replace (JLabel. "Replace:")
+          _ (.setFont lbl-replace (Font. "SansSerif" Font/PLAIN 12))
+          grid (JPanel. (GridLayout. 2 1 0 2))
+          _ (.setBackground grid (Color. 248 248 248))]
+
+      (.add row1 lbl-find)
+      (.add row1 find-field)
+      (.add row1 btn-prev)
+      (.add row1 btn-next)
+      (.add row1 match-case-cb)
+      (.add row1 match-label)
+      (.add row1 (Box/createHorizontalStrut 8))
+      (.add row1 btn-close)
+
+      (.add row2 lbl-replace)
+      (.add row2 replace-field)
+      (.add row2 btn-replace)
+      (.add row2 btn-replace-all)
+
+      (.add grid row1)
+      (.add grid row2)
+      (.add panel grid BorderLayout/CENTER))
+
+    (.setVisible panel false)
+
+    {:panel panel
+     :open-find! open-find!
+     :open-replace! open-replace!
+     :close-panel! close-panel!
+     :find-next! find-next!
+     :find-prev! find-prev!}))
+
 (defn setup-editor-context-menu!
   "Attaches a right-click context menu to the editor with navigation, refactoring, and edit actions."
-  [^JTextComponent editor jump-fn! rename-fn!]
+  [^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! find-fn! replace-fn!]
   (let [popup (JPopupMenu.)
         item-jump (JMenuItem. "Jump to Definition (F12)")
         item-rename (JMenuItem. "Rename Symbol... (Shift+F6)")
+        item-doc (JMenuItem. "Quick Documentation (Ctrl+Q)")
+        item-comment (JMenuItem. "Toggle Comment (Ctrl+/)")
         item-indent (JMenuItem. "Indent Selection (Tab)")
         item-unindent (JMenuItem. "Unindent Selection (Shift+Tab)")
+        item-find (JMenuItem. "Find... (Ctrl+F)")
+        item-replace (JMenuItem. "Replace... (Ctrl+H)")
         item-cut (JMenuItem. "Cut")
         item-copy (JMenuItem. "Copy")
         item-paste (JMenuItem. "Paste")]
     (.addActionListener item-jump (proxy [ActionListener] [] (actionPerformed [e] (jump-fn!))))
     (.addActionListener item-rename (proxy [ActionListener] [] (actionPerformed [e] (rename-fn!))))
+    (.addActionListener item-doc (proxy [ActionListener] [] (actionPerformed [e] (doc-fn!))))
+    (.addActionListener item-comment (proxy [ActionListener] [] (actionPerformed [e] (comment-fn!))))
     (.addActionListener item-indent (proxy [ActionListener] [] (actionPerformed [e] (indent-selection! editor))))
     (.addActionListener item-unindent (proxy [ActionListener] [] (actionPerformed [e] (unindent-selection! editor))))
+    (.addActionListener item-find (proxy [ActionListener] [] (actionPerformed [e] (find-fn!))))
+    (.addActionListener item-replace (proxy [ActionListener] [] (actionPerformed [e] (replace-fn!))))
     (.addActionListener item-cut (proxy [ActionListener] [] (actionPerformed [e] (.cut editor))))
     (.addActionListener item-copy (proxy [ActionListener] [] (actionPerformed [e] (.copy editor))))
     (.addActionListener item-paste (proxy [ActionListener] [] (actionPerformed [e] (.paste editor))))
     (.add popup item-jump)
     (.add popup item-rename)
+    (.add popup item-doc)
     (.addSeparator popup)
+    (.add popup item-comment)
     (.add popup item-indent)
     (.add popup item-unindent)
+    (.addSeparator popup)
+    (.add popup item-find)
+    (.add popup item-replace)
     (.addSeparator popup)
     (.add popup item-cut)
     (.add popup item-copy)
@@ -484,6 +946,8 @@
               (.setBorder line-numbers (BorderFactory/createEmptyBorder 2 4 2 6)))
         editor-scroll (JScrollPane. editor)
         _ (.setRowHeaderView editor-scroll line-numbers)
+        definitions-panel (JPanel. (BorderLayout.))
+        _ (.add definitions-panel editor-scroll BorderLayout/CENTER)
         syntax-controller (syntax/setup-syntax-highlighting! editor {:delay-ms 60})
         highlight-now! (:highlight-now! syntax-controller)
         bracket-info (:bracket-info syntax-controller)
@@ -505,7 +969,7 @@
               (.add interactions-panel prompt-panel BorderLayout/SOUTH))
 
         ;; Split Pane: Top = Definitions, Bottom = Interactions
-        split-pane (JSplitPane. JSplitPane/VERTICAL_SPLIT editor-scroll interactions-panel)
+        split-pane (JSplitPane. JSplitPane/VERTICAL_SPLIT definitions-panel interactions-panel)
         _ (do (.setResizeWeight split-pane 0.6)
               (.setDividerLocation split-pane 380))
 
@@ -520,9 +984,10 @@
               (.add status-panel status-state BorderLayout/EAST))
 
         ;; Toolbar Buttons
-        btn-run (JButton. "▶ Run (Ctrl+Enter)")
+        btn-run (JButton. "▶ Run (F5)")
         btn-stop (JButton. "⏹ Stop")
         _ (.setEnabled btn-stop false)
+        btn-find (JButton. "Find (Ctrl+F)")
         btn-clear (JButton. "Clear Output (Ctrl+L)")
         btn-cheatsheet (JButton. "Cheatsheet (F1)")
         btn-font-plus (JButton. "A+")
@@ -574,7 +1039,7 @@
                       (str "============================================================\n"
                            " " app-name " " app-version "  |  Clojure " c-ver "  |  Java " j-ver "\n"
                            "============================================================\n"
-                           " Definitions (Top): Type Clojure code and press [Run] or Ctrl+Enter\n"
+                           " Definitions (Top): Type Clojure code and press [Run] or F5\n"
                            " Interactions (Bottom): REPL expressions & GUI standard input\n"
                            " Stdin Console: Use (read-line) in code; input is prompted below\n"
                            " Cheatsheet: Click [Cheatsheet] or press F1 to open Clojure Cheatsheet in browser\n"
@@ -649,72 +1114,96 @@
                       (set-status! :idle))
 
                     (jump-action! []
-                      (jump-to-definition! frame editor set-status!))
+                      (jump-to-definition! frame editor))
 
                     (rename-action! []
-                      (rename-symbol-dialog! frame editor highlight-now! update-title! set-status!))]
+                      (rename-symbol-dialog! frame editor highlight-now! update-title! set-status!))
 
-              ;; --- Input Field Action (REPL & Stdin) ---
-              (.addActionListener input-field
-                (proxy [ActionListener] []
-                  (actionPerformed [e]
-                    (let [text (.getText input-field)]
-                      (.setText input-field "")
-                      (if (eval/waiting-for-input? eval-ctx)
-                        ;; Process GUI stdin input
+                    (comment-action! []
+                      (toggle-comment! editor)
+                      (update-dirty!)
+                      (highlight-now!))
+
+                    (quick-doc-action! []
+                      (show-quick-doc! frame editor))]
+
+              (let [find-ctrl (create-find-replace-panel editor highlight-now! update-title! set-status!)
+                    find-panel (:panel find-ctrl)
+                    open-find! (:open-find! find-ctrl)
+                    open-replace! (:open-replace! find-ctrl)
+                    close-find! (:close-panel! find-ctrl)
+                    find-next! (:find-next! find-ctrl)
+                    find-prev! (:find-prev! find-ctrl)]
+                (.add definitions-panel find-panel BorderLayout/SOUTH)
+
+                ;; --- Input Field Action (REPL & Stdin) ---
+                (.addActionListener input-field
+                  (proxy [ActionListener] []
+                    (actionPerformed [e]
+                      (let [text (.getText input-field)]
+                        (.setText input-field "")
+                        (if (eval/waiting-for-input? eval-ctx)
+                          ;; Process GUI stdin input
+                          (do
+                            (append-output! (str text "\n"))
+                            (eval/push-stdin! eval-ctx text))
+                          ;; Process REPL expression
+                          (if (eval/evaluating? eval-ctx)
+                            (append-output! "; [Warning: Code is currently running. Click Stop to cancel.]\n")
+                            (when-not (str/blank? text)
+                              (swap! (:history eval-ctx) eval/history-add text)
+                              (append-output! (str "> " text "\n"))
+                              (run-code-string! text))))))))
+
+                ;; History navigation on Up / Down arrow
+                (.addKeyListener input-field
+                  (proxy [KeyAdapter] []
+                    (keyPressed [e]
+                      (cond
+                        (= (.getKeyCode e) KeyEvent/VK_UP)
                         (do
-                          (append-output! (str text "\n"))
-                          (eval/push-stdin! eval-ctx text))
-                        ;; Process REPL expression
-                        (if (eval/evaluating? eval-ctx)
-                          (append-output! "; [Warning: Code is currently running. Click Stop to cancel.]\n")
-                          (when-not (str/blank? text)
-                            (swap! (:history eval-ctx) eval/history-add text)
-                            (append-output! (str "> " text "\n"))
-                            (run-code-string! text))))))))
+                          (.consume e)
+                          (let [[new-hist display-text] (eval/history-prev @(:history eval-ctx) (.getText input-field))]
+                            (reset! (:history eval-ctx) new-hist)
+                            (.setText input-field display-text)))
 
-              ;; History navigation on Up / Down arrow
-              (.addKeyListener input-field
-                (proxy [KeyAdapter] []
-                  (keyPressed [e]
-                    (cond
-                      (= (.getKeyCode e) KeyEvent/VK_UP)
-                      (do
-                        (.consume e)
-                        (let [[new-hist display-text] (eval/history-prev @(:history eval-ctx) (.getText input-field))]
-                          (reset! (:history eval-ctx) new-hist)
-                          (.setText input-field display-text)))
+                        (= (.getKeyCode e) KeyEvent/VK_DOWN)
+                        (do
+                          (.consume e)
+                          (let [[new-hist display-text] (eval/history-next @(:history eval-ctx))]
+                            (reset! (:history eval-ctx) new-hist)
+                            (.setText input-field display-text)))))))
 
-                      (= (.getKeyCode e) KeyEvent/VK_DOWN)
-                      (do
-                        (.consume e)
-                        (let [[new-hist display-text] (eval/history-next @(:history eval-ctx))]
-                          (reset! (:history eval-ctx) new-hist)
-                          (.setText input-field display-text)))))))
+                ;; Wire toolbar buttons
+                (.addActionListener btn-run (proxy [ActionListener] [] (actionPerformed [e] (run-definitions!))))
+                (.addActionListener btn-stop (proxy [ActionListener] [] (actionPerformed [e] (stop-current-eval!))))
+                (.addActionListener btn-find (proxy [ActionListener] [] (actionPerformed [e] (open-find!))))
+                (.addActionListener btn-clear (proxy [ActionListener] [] (actionPerformed [e] (print-banner!))))
+                (.addActionListener btn-cheatsheet (proxy [ActionListener] [] (actionPerformed [e] (open-cheatsheet!))))
+                (.addActionListener btn-font-plus
+                  (proxy [ActionListener] []
+                    (actionPerformed [e]
+                      (swap! font-size #(min 32 (+ % 2)))
+                      (apply-font! @font-size))))
+                (.addActionListener btn-font-minus
+                  (proxy [ActionListener] []
+                    (actionPerformed [e]
+                      (swap! font-size #(max 10 (- % 2)))
+                      (apply-font! @font-size))))
 
-              ;; Wire toolbar buttons
-              (.addActionListener btn-run (proxy [ActionListener] [] (actionPerformed [e] (run-definitions!))))
-              (.addActionListener btn-stop (proxy [ActionListener] [] (actionPerformed [e] (stop-current-eval!))))
-              (.addActionListener btn-clear (proxy [ActionListener] [] (actionPerformed [e] (print-banner!))))
-              (.addActionListener btn-cheatsheet (proxy [ActionListener] [] (actionPerformed [e] (open-cheatsheet!))))
-              (.addActionListener btn-font-plus
-                (proxy [ActionListener] []
-                  (actionPerformed [e]
-                    (swap! font-size #(min 32 (+ % 2)))
-                    (apply-font! @font-size))))
-              (.addActionListener btn-font-minus
-                (proxy [ActionListener] []
-                  (actionPerformed [e]
-                    (swap! font-size #(max 10 (- % 2)))
-                    (apply-font! @font-size))))
+                ;; Setup Editor Listeners & Shortcuts
+                (setup-bracket-matching! editor bracket-info)
+                (setup-auto-brackets! editor)
+                (setup-editor-keys! editor comment-action!)
 
-              ;; Setup Editor Listeners & Shortcuts
-              (setup-bracket-matching! editor bracket-info)
-              (setup-tab-key! editor)
-
-                ;; Editor shortcuts for Jump to Definition & Rename
+                ;; Editor shortcuts for Run Definitions, Jump to Definition, Rename, Quick Doc, Find/Replace, Escape
                 (let [im (.getInputMap editor)
                       am (.getActionMap editor)]
+                  (.put im (KeyStroke/getKeyStroke "F5") "run-definitions")
+                  (.put am "run-definitions"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (run-definitions!))))
+
                   (.put im (KeyStroke/getKeyStroke "F12") "jump-to-def")
                   (.put im (KeyStroke/getKeyStroke "control B") "jump-to-def")
                   (.put am "jump-to-def"
@@ -726,9 +1215,44 @@
                   (.put im (KeyStroke/getKeyStroke KeyEvent/VK_F6 KeyEvent/SHIFT_DOWN_MASK) "rename-symbol")
                   (.put am "rename-symbol"
                     (proxy [javax.swing.AbstractAction] []
-                      (actionPerformed [e] (rename-action!)))))
+                      (actionPerformed [e] (rename-action!))))
 
-                (setup-editor-context-menu! editor jump-action! rename-action!)
+                  (.put im (KeyStroke/getKeyStroke "control Q") "quick-doc")
+                  (.put im (KeyStroke/getKeyStroke "shift F1") "quick-doc")
+                  (.put am "quick-doc"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (quick-doc-action!))))
+
+                  (.put im (KeyStroke/getKeyStroke "control F") "open-find")
+                  (.put am "open-find"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (open-find!))))
+
+                  (.put im (KeyStroke/getKeyStroke "control H") "open-replace")
+                  (.put im (KeyStroke/getKeyStroke "control R") "open-replace")
+                  (.put am "open-replace"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (open-replace!))))
+
+                  (.put im (KeyStroke/getKeyStroke "F3") "find-next")
+                  (.put am "find-next"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (find-next!))))
+
+                  (.put im (KeyStroke/getKeyStroke "shift F3") "find-prev")
+                  (.put am "find-prev"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (find-prev!))))
+
+                  (.put im (KeyStroke/getKeyStroke "ESCAPE") "editor-escape")
+                  (.put am "editor-escape"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e]
+                        (if (.isVisible find-panel)
+                          (close-find!)
+                          (stop-current-eval!))))))
+
+                (setup-editor-context-menu! editor jump-action! rename-action! quick-doc-action! comment-action! open-find! open-replace!)
 
                 (.. editor getDocument (addDocumentListener
                   (proxy [DocumentListener] []
@@ -861,31 +1385,56 @@
                       _ (.setMnemonic menu-edit (int \E))
                       item-undo (JMenuItem. "Undo")
                       item-redo (JMenuItem. "Redo")
+                      item-find (JMenuItem. "Find...")
+                      item-replace (JMenuItem. "Replace...")
+                      item-find-next (JMenuItem. "Find Next")
+                      item-find-prev (JMenuItem. "Find Previous")
                       item-jump (JMenuItem. "Jump to Definition")
                       item-rename (JMenuItem. "Rename Symbol...")
+                      item-doc (JMenuItem. "Quick Documentation")
+                      item-comment (JMenuItem. "Toggle Comment")
                       item-indent (JMenuItem. "Indent Selection")
                       item-unindent (JMenuItem. "Unindent Selection")
                       item-clear (JMenuItem. "Clear Output")
                       _ (do (.setAccelerator item-undo (KeyStroke/getKeyStroke "control Z"))
                             (.setAccelerator item-redo (KeyStroke/getKeyStroke "control Y"))
+                            (.setAccelerator item-find (KeyStroke/getKeyStroke "control F"))
+                            (.setAccelerator item-replace (KeyStroke/getKeyStroke "control H"))
+                            (.setAccelerator item-find-next (KeyStroke/getKeyStroke "F3"))
+                            (.setAccelerator item-find-prev (KeyStroke/getKeyStroke "shift F3"))
                             (.setAccelerator item-jump (KeyStroke/getKeyStroke "F12"))
                             (.setAccelerator item-rename (KeyStroke/getKeyStroke "shift F6"))
+                            (.setAccelerator item-doc (KeyStroke/getKeyStroke "control Q"))
+                            (.setAccelerator item-comment (KeyStroke/getKeyStroke "control SLASH"))
                             (.setAccelerator item-indent (KeyStroke/getKeyStroke "TAB"))
                             (.setAccelerator item-unindent (KeyStroke/getKeyStroke "shift TAB"))
                             (.setAccelerator item-clear (KeyStroke/getKeyStroke "control L"))
                             (.addActionListener item-undo (proxy [ActionListener] [] (actionPerformed [e] (when (.canUndo undo-mgr) (.undo undo-mgr)))))
                             (.addActionListener item-redo (proxy [ActionListener] [] (actionPerformed [e] (when (.canRedo undo-mgr) (.redo undo-mgr)))))
+                            (.addActionListener item-find (proxy [ActionListener] [] (actionPerformed [e] (open-find!))))
+                            (.addActionListener item-replace (proxy [ActionListener] [] (actionPerformed [e] (open-replace!))))
+                            (.addActionListener item-find-next (proxy [ActionListener] [] (actionPerformed [e] (find-next!))))
+                            (.addActionListener item-find-prev (proxy [ActionListener] [] (actionPerformed [e] (find-prev!))))
                             (.addActionListener item-jump (proxy [ActionListener] [] (actionPerformed [e] (jump-action!))))
                             (.addActionListener item-rename (proxy [ActionListener] [] (actionPerformed [e] (rename-action!))))
+                            (.addActionListener item-doc (proxy [ActionListener] [] (actionPerformed [e] (quick-doc-action!))))
+                            (.addActionListener item-comment (proxy [ActionListener] [] (actionPerformed [e] (comment-action!))))
                             (.addActionListener item-indent (proxy [ActionListener] [] (actionPerformed [e] (indent-selection! editor))))
                             (.addActionListener item-unindent (proxy [ActionListener] [] (actionPerformed [e] (unindent-selection! editor))))
                             (.addActionListener item-clear (proxy [ActionListener] [] (actionPerformed [e] (print-banner!))))
                             (.add menu-edit item-undo)
                             (.add menu-edit item-redo)
                             (.addSeparator menu-edit)
+                            (.add menu-edit item-find)
+                            (.add menu-edit item-replace)
+                            (.add menu-edit item-find-next)
+                            (.add menu-edit item-find-prev)
+                            (.addSeparator menu-edit)
                             (.add menu-edit item-jump)
                             (.add menu-edit item-rename)
+                            (.add menu-edit item-doc)
                             (.addSeparator menu-edit)
+                            (.add menu-edit item-comment)
                             (.add menu-edit item-indent)
                             (.add menu-edit item-unindent)
                             (.addSeparator menu-edit)
@@ -897,7 +1446,7 @@
                       item-run-def (JMenuItem. "Run Definitions")
                       item-run-sel (JMenuItem. "Run Selection / Current Form")
                       item-stop (JMenuItem. "Stop Evaluation")
-                      _ (do (.setAccelerator item-run-def (KeyStroke/getKeyStroke "control ENTER"))
+                      _ (do (.setAccelerator item-run-def (KeyStroke/getKeyStroke "F5"))
                             (.setAccelerator item-run-sel (KeyStroke/getKeyStroke "control E"))
                             (.setAccelerator item-stop (KeyStroke/getKeyStroke "ESCAPE"))
                             (.addActionListener item-run-def (proxy [ActionListener] [] (actionPerformed [e] (run-definitions!))))
@@ -928,10 +1477,13 @@
                       _ (.setMnemonic menu-help (int \H))
                       item-cheat (JMenuItem. "Clojure Cheatsheet")
                       item-cheat-dialog (JMenuItem. "Cheatsheet Examples (Dialog)")
+                      item-help-doc (JMenuItem. "Quick Documentation")
                       item-about (JMenuItem. "About DrClojure")
                       _ (do (.setAccelerator item-cheat (KeyStroke/getKeyStroke "F1"))
+                            (.setAccelerator item-help-doc (KeyStroke/getKeyStroke "control Q"))
                             (.addActionListener item-cheat (proxy [ActionListener] [] (actionPerformed [e] (open-cheatsheet!))))
                             (.addActionListener item-cheat-dialog (proxy [ActionListener] [] (actionPerformed [e] (show-cheatsheet-dialog! frame editor))))
+                            (.addActionListener item-help-doc (proxy [ActionListener] [] (actionPerformed [e] (quick-doc-action!))))
                             (.addActionListener item-about
                                 (proxy [ActionListener] []
                                   (actionPerformed [e]
@@ -945,6 +1497,7 @@
                                       (str "About " app-name) JOptionPane/INFORMATION_MESSAGE))))
                             (.add menu-help item-cheat)
                             (.add menu-help item-cheat-dialog)
+                            (.add menu-help item-help-doc)
                             (.add menu-help item-about))]
 
                   (.add menu-bar menu-file)
@@ -960,6 +1513,7 @@
                   (.add toolbar btn-run)
                   (.add toolbar btn-stop)
                   (.addSeparator toolbar)
+                  (.add toolbar btn-find)
                   (.add toolbar btn-clear)
                   (.addSeparator toolbar)
                   (.add toolbar btn-font-plus)
@@ -986,4 +1540,4 @@
                     (.pack frame)
                     (.setLocationRelativeTo frame nil)
                     (.requestFocusInWindow editor)
-                    frame))))))))))
+                    frame)))))))))))

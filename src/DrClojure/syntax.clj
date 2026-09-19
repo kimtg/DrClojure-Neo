@@ -394,9 +394,86 @@
                                                    (= (.substring text s e) sym-name)))
                                             prior-tokens))]
               (let [[_ s e] target]
-                {:symbol sym-name
-                 :start s
-                 :end e
-                 :line (line-number-at-offset text s)
-                 :kind :local}))))))))
+                 {:symbol sym-name
+                  :start s
+                  :end e
+                  :line (line-number-at-offset text s)
+                  :kind :local}))))))))
 
+;; --- Smart Indentation, Search & Quick Documentation ---
+
+(defn compute-smart-indent
+  "Calculates the appropriate indentation spaces string for a new line created at `pos` in `text`.
+   Carries forward current line indentation, and adds 2 spaces if the line opened unclosed brackets."
+  [^String text pos]
+  (if (or (nil? text) (not (pos? (.length text))) (not (pos? pos)))
+    ""
+    (let [pos (min (.length text) (max 0 (int pos)))
+          line-start (let [idx (.lastIndexOf text "\n" (dec pos))]
+                       (if (neg? idx) 0 (inc idx)))
+          line-prefix (.substring text line-start pos)
+          base-indent (or (re-find #"^[ ]+" line-prefix) "")
+          ;; Count unclosed brackets in the code part of line-prefix
+          tokens (tokenize line-prefix)
+          open-brackets (count (filter (fn [[tok-type s _]]
+                                         (and (= tok-type :bracket)
+                                              (open->close (.charAt line-prefix s))))
+                                       tokens))
+          close-brackets (count (filter (fn [[tok-type s _]]
+                                          (and (= tok-type :bracket)
+                                               (close->open (.charAt line-prefix s))))
+                                        tokens))
+          unclosed (- open-brackets close-brackets)
+          extra-indent (if (pos? unclosed) "  " "")]
+      (str base-indent extra-indent))))
+
+(defn find-text-matches
+  "Finds all occurrences of `query` in `text`.
+   Returns vector of `[start end]` character offset pairs.
+   Options:
+     `:case-sensitive?` (boolean, default false)"
+  [^String text ^String query & [{:keys [case-sensitive?]}]]
+  (if (or (str/blank? text) (str/blank? query))
+    []
+    (let [flags (if case-sensitive? Pattern/LITERAL (bit-or Pattern/LITERAL Pattern/CASE_INSENSITIVE))
+          pat (Pattern/compile query flags)
+          matcher (.matcher pat text)
+          results (transient [])]
+      (while (.find matcher)
+        (conj! results [(.start matcher) (.end matcher)]))
+      (persistent! results))))
+
+(defn get-symbol-doc
+  "Retrieves documentation and arglists for `sym-name`.
+   Checks runtime environment first (resolving against clojure.core or loaded namespaces),
+   then checks definition within `text` if provided.
+   Returns a map with `:status` (:found, :buffer-def, :not-found) and metadata."
+  [^String sym-name & [^String text pos]]
+  (when-not (str/blank? sym-name)
+    (let [sym (symbol sym-name)
+          v (try (resolve sym) (catch Exception _ nil))]
+      (if v
+        (let [m (meta v)
+              ns-str (str (or (:ns m) "clojure.core"))
+              name-str (str (:name m))
+              arglists (when-let [args (:arglists m)] (str args))
+              doc-str (:doc m)
+              file-str (or (:file m) "unknown")
+              line-num (:line m)
+              macro? (boolean (:macro m))]
+          {:status :found
+           :symbol sym-name
+           :ns ns-str
+           :name name-str
+           :arglists arglists
+           :doc doc-str
+           :macro? macro?
+           :file file-str
+           :line line-num})
+        (if-let [def-target (and text (find-definition text sym-name pos))]
+          {:status :buffer-def
+           :symbol sym-name
+           :line (:line def-target)
+           :kind (:kind def-target)}
+          {:status :not-found
+           :symbol sym-name})))))

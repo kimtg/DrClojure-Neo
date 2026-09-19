@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
-  (:import (javax.swing JFrame JTextPane KeyStroke)
+  (:import (java.awt.event KeyEvent)
+           (javax.swing JDialog JFrame JTextPane KeyStroke)
            (javax.swing.text DefaultStyledDocument)))
 
 (deftest app-metadata-test
@@ -107,21 +108,38 @@
       (is (= "line 1\nline 2" (.getText pane))))))
 
 (deftest edit-menu-navigation-test
-  (testing "Edit menu contains Jump to Definition, Rename, and Indent/Unindent"
+  (testing "Edit menu contains Find/Replace, Navigation, Doc, Comment, and Indent actions"
     (let [frame (ui/create-ide nil)
           menubar (.getJMenuBar frame)
           edit-menu (.getMenu menubar 1) ;; 0 = File, 1 = Edit
           item-count (.getItemCount edit-menu)
-          items (map (fn [i] (when-let [item (.getItem edit-menu i)] (.getText item)))
-                     (range item-count))]
-      (is (some #{"Jump to Definition"} items))
-      (is (some #{"Rename Symbol..."} items))
-      (is (some #{"Indent Selection"} items))
-      (is (some #{"Unindent Selection"} items))
+          items (set (keep (fn [i] (when-let [item (.getItem edit-menu i)] (.getText item)))
+                           (range item-count)))]
+      (is (contains? items "Find..."))
+      (is (contains? items "Replace..."))
+      (is (contains? items "Find Next"))
+      (is (contains? items "Find Previous"))
+      (is (contains? items "Jump to Definition"))
+      (is (contains? items "Rename Symbol..."))
+      (is (contains? items "Quick Documentation"))
+      (is (contains? items "Toggle Comment"))
+      (is (contains? items "Indent Selection"))
+      (is (contains? items "Unindent Selection"))
+      (.dispose frame))))
+
+(deftest run-menu-hotkey-test
+  (testing "Run Definitions hotkey accelerator is F5"
+    (let [frame (ui/create-ide nil)
+          menubar (.getJMenuBar frame)
+          run-menu (.getMenu menubar 2) ;; 0 = File, 1 = Edit, 2 = Run
+          run-item (.getItem run-menu 0)
+          accel (.getAccelerator run-item)]
+      (is (= "Run Definitions" (.getText run-item)))
+      (is (= (KeyStroke/getKeyStroke "F5") accel))
       (.dispose frame))))
 
 (deftest jump-to-definition-no-selection-test
-  (testing "Jump to definition with caret only (no selection) on multi-line code"
+  (testing "Jump to definition with caret only (no selection) on multi-line code does not modify status bar"
     (let [frame (JFrame.)
           editor (JTextPane.)
           status-atom (atom nil)
@@ -137,26 +155,202 @@
         (.setCaretPosition editor target-offset)
         (is (nil? (.getSelectedText editor)))
         (ui/jump-to-definition! frame editor set-status!)
-        ;; Should jump to line 1 definition and select "calculate-total"
+        ;; Should jump to line 1 definition and place caret at start of "calculate-total" without selecting
+        (is (= 6 (.getCaretPosition editor)))
         (is (= 6 (.getSelectionStart editor)))
-        (is (= 21 (.getSelectionEnd editor)))
-        (is (= "calculate-total" (.getSelectedText editor)))
-        (is (= "Jumped to definition of 'calculate-total' (line 1)" @status-atom))))
+        (is (= 6 (.getSelectionEnd editor)))
+        (is (nil? (.getSelectedText editor)))
+        (is (nil? @status-atom)))))
 
-    (testing "Jump to definition on Unicode / Korean symbol without selection"
-      (let [frame (JFrame.)
-            editor (JTextPane.)
-            status-atom (atom nil)
-            set-status! (fn [msg] (reset! status-atom msg))
-            code (str "(defn 넓이-계산 [가로 세로]\n"
-                      "  (* 가로 세로))\n\n"
-                      "(넓이-계산 10 20)\n")]
-        (.setText editor code)
-        (let [usage-offset (.indexOf code "(넓이-계산 10")]
-          ;; Place caret on '(' immediately before 넓이-계산
-          (.setCaretPosition editor usage-offset)
-          (ui/jump-to-definition! frame editor set-status!)
-          (is (= 6 (.getSelectionStart editor)))
-          (is (= 11 (.getSelectionEnd editor)))
-          (is (= "넓이-계산" (.getSelectedText editor)))
-          (is (= "Jumped to definition of '넓이-계산' (line 1)" @status-atom)))))))
+  (testing "Jump to definition on Unicode / Korean symbol without selection does not modify status bar"
+    (let [frame (JFrame.)
+          editor (JTextPane.)
+          status-atom (atom nil)
+          set-status! (fn [msg] (reset! status-atom msg))
+          code (str "(defn 넓이-계산 [가로 세로]\n"
+                    "  (* 가로 세로))\n\n"
+                    "(넓이-계산 10 20)\n")]
+      (.setText editor code)
+      (let [usage-offset (.indexOf code "(넓이-계산 10")]
+        ;; Place caret on '(' immediately before 넓이-계산
+        (.setCaretPosition editor usage-offset)
+        (ui/jump-to-definition! frame editor set-status!)
+        (is (= 6 (.getCaretPosition editor)))
+        (is (= 6 (.getSelectionStart editor)))
+        (is (= 6 (.getSelectionEnd editor)))
+        (is (nil? (.getSelectedText editor)))
+        (is (nil? @status-atom))))))
+
+(deftest toggle-comment-test
+  (testing "Single line toggle comment"
+    (let [pane (JTextPane.)]
+      (.setText pane "(println \"hello\")")
+      (.setCaretPosition pane 3)
+      (ui/toggle-comment! pane)
+      (is (= "; (println \"hello\")" (.getText pane)))
+      (ui/toggle-comment! pane)
+      (is (= "(println \"hello\")" (.getText pane)))))
+
+  (testing "Multi-line toggle comment"
+    (let [pane (JTextPane.)]
+      (.setText pane "(defn foo []\n  (+ 1 2))\n")
+      (.setSelectionStart pane 0)
+      (.setSelectionEnd pane (.length (.getText pane)))
+      (ui/toggle-comment! pane)
+      (is (= "; (defn foo []\n;   (+ 1 2))\n" (.getText pane)))
+      (ui/toggle-comment! pane)
+      (is (= "(defn foo []\n  (+ 1 2))\n" (.getText pane)))))
+
+  (testing "Preserves empty lines when commenting block"
+    (let [pane (JTextPane.)]
+      (.setText pane "(def a 1)\n\n(def b 2)")
+      (.setSelectionStart pane 0)
+      (.setSelectionEnd pane (.length (.getText pane)))
+      (ui/toggle-comment! pane)
+      (is (= "; (def a 1)\n\n; (def b 2)" (.getText pane)))
+      (ui/toggle-comment! pane)
+      (is (= "(def a 1)\n\n(def b 2)" (.getText pane))))))
+
+(deftest smart-enter-test
+  (testing "Smart enter inside unclosed form indents 2 spaces from form start"
+    (let [pane (JTextPane.)]
+      (.setText pane "(defn square [x]")
+      (.setCaretPosition pane (.length (.getText pane)))
+      (ui/handle-smart-enter! pane)
+      (is (= "(defn square [x]\n  " (.getText pane)))
+      (is (= (count "(defn square [x]\n  ") (.getCaretPosition pane)))))
+
+  (testing "Smart enter inside let bindings indents properly"
+    (let [pane (JTextPane.)]
+      (.setText pane "(let [a 1")
+      (.setCaretPosition pane (.length (.getText pane)))
+      (ui/handle-smart-enter! pane)
+      (is (= "(let [a 1\n  " (.getText pane)))))
+
+  (testing "Smart enter replaces selection if text was selected"
+    (let [pane (JTextPane.)]
+      (.setText pane "(foo [x] REPLACE_ME)")
+      (let [idx (.indexOf (.getText pane) "REPLACE_ME")]
+        (.setSelectionStart pane idx)
+        (.setSelectionEnd pane (+ idx 10))
+        (ui/handle-smart-enter! pane)
+        (is (= "(foo [x] \n  )" (.getText pane)))))))
+
+(deftest find-replace-panel-test
+  (testing "Inline find and replace panel operations"
+    (let [editor (JTextPane.)
+          _ (.setText editor "(println \"apple\")\n(println \"banana\")\n(println \"apple\")\n")
+          status-atom (atom nil)
+          title-atom (atom nil)
+          highlight-atom (atom nil)
+          ctrl (ui/create-find-replace-panel
+                 editor
+                 (fn [] (reset! highlight-atom true))
+                 (fn [] (reset! title-atom true))
+                 (fn [msg] (reset! status-atom msg)))
+          panel (:panel ctrl)
+          find-next! (:find-next! ctrl)
+          find-prev! (:find-prev! ctrl)
+          open-find! (:open-find! ctrl)
+          close-panel! (:close-panel! ctrl)]
+
+      ;; Initially panel is hidden
+      (is (false? (.isVisible panel)))
+
+      ;; Open find
+      (open-find!)
+      (is (true? (.isVisible panel)))
+
+      ;; Find field components
+      (let [grid (.getComponent panel 0)
+            row1 (.getComponent grid 0)
+            row2 (.getComponent grid 1)
+            find-field (.getComponent row1 1)
+            match-label (.getComponent row1 5)
+            replace-field (.getComponent row2 1)
+            btn-replace (.getComponent row2 2)
+            btn-replace-all (.getComponent row2 3)]
+
+        ;; Search for apple
+        (.setText find-field "apple")
+        ;; Verify match label shows "1 of 2"
+        (is (= "1 of 2" (.getText match-label)))
+        (is (= "apple" (.getSelectedText editor)))
+
+        ;; Next match
+        (find-next!)
+        (is (= "2 of 2" (.getText match-label)))
+        (is (= "apple" (.getSelectedText editor)))
+        (is (= 47 (.getSelectionStart editor)))
+
+        ;; Prev match
+        (find-prev!)
+        (is (= "1 of 2" (.getText match-label)))
+        (is (= 10 (.getSelectionStart editor)))
+
+        ;; Replace current match with orange
+        (.setText replace-field "orange")
+        (.doClick btn-replace)
+        (is (not= -1 (.indexOf (.getText editor) "orange")))
+
+        ;; Replace all remaining apples
+        (.setText find-field "apple")
+        (.setText replace-field "pear")
+        (.doClick btn-replace-all)
+        (is (= -1 (.indexOf (.getText editor) "apple")))
+        (is (not= -1 (.indexOf (.getText editor) "pear")))
+
+        ;; Close panel
+        (close-panel!)
+        (is (false? (.isVisible panel)))))))
+
+(deftest auto-brackets-test
+  (testing "Auto-closing delimiter insertion and selection wrapping"
+    (let [editor (JTextPane.)]
+      (ui/setup-auto-brackets! editor)
+      (let [kl (first (.getKeyListeners editor))]
+        (is (some? kl))
+
+        ;; 1. Open parenthesis inserts '()' and places caret inside
+        (.setText editor "")
+        (.setCaretPosition editor 0)
+        (.keyTyped kl (KeyEvent. editor KeyEvent/KEY_TYPED (System/currentTimeMillis) 0 KeyEvent/VK_UNDEFINED \())
+        (is (= "()" (.getText editor)))
+        (is (= 1 (.getCaretPosition editor)))
+
+        ;; 2. Closing parenthesis when next char matches steps over
+        (.keyTyped kl (KeyEvent. editor KeyEvent/KEY_TYPED (System/currentTimeMillis) 0 KeyEvent/VK_UNDEFINED \)))
+        (is (= "()" (.getText editor)))
+        (is (= 2 (.getCaretPosition editor)))
+
+        ;; 3. Selection wrapping: selecting 'hello' and typing '[' wraps to '[hello]'
+        (.setText editor "hello")
+        (.setSelectionStart editor 0)
+        (.setSelectionEnd editor 5)
+        (.keyTyped kl (KeyEvent. editor KeyEvent/KEY_TYPED (System/currentTimeMillis) 0 KeyEvent/VK_UNDEFINED \[))
+        (is (= "[hello]" (.getText editor)))
+
+        ;; 4. Paired backspace deletion: caret between '[]' deletes both
+        (.setText editor "[]")
+        (.setCaretPosition editor 1)
+        (.keyPressed kl (KeyEvent. editor KeyEvent/KEY_PRESSED (System/currentTimeMillis) 0 KeyEvent/VK_BACK_SPACE KeyEvent/CHAR_UNDEFINED))
+        (is (= "" (.getText editor)))
+        (is (= 0 (.getCaretPosition editor)))))))
+
+(deftest quick-doc-test
+  (testing "Quick doc lookup for core symbol does not modify status bar"
+    (let [frame (JFrame.)
+          editor (JTextPane.)
+          status-atom (atom nil)
+          set-status! (fn [msg] (reset! status-atom msg))]
+      (.setText editor "(map inc [1 2 3])")
+      (.setCaretPosition editor 2) ;; On "map"
+      ;; show-quick-doc! opens a non-modal JDialog
+      (ui/show-quick-doc! frame editor set-status!)
+      ;; Verify status bar was not changed
+      (is (nil? @status-atom))
+      ;; Clean up any opened dialogs
+      (doseq [w (JFrame/getWindows)]
+        (when (instance? JDialog w)
+          (.dispose w)))
+      (.dispose frame))))
