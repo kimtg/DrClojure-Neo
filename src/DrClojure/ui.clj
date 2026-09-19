@@ -10,7 +10,8 @@
   (:import (javax.swing JFrame JPanel JSplitPane JScrollPane JTextArea JTextField JTextPane
                         JButton JLabel JMenuBar JMenu JMenuItem JPopupMenu KeyStroke
                         JFileChooser JOptionPane JToolBar BorderFactory Box
-                        SwingUtilities UIManager JDialog JViewport JComponent JCheckBox AbstractAction)
+                        SwingUtilities UIManager JDialog JViewport JComponent JCheckBox AbstractAction
+                        JList DefaultListModel DefaultListCellRenderer ListSelectionModel ScrollPaneConstants)
            (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType)
            (javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent
                              DefaultStyledDocument AbstractDocument$DefaultDocumentEvent)
@@ -805,15 +806,258 @@
      :find-next! find-next!
      :find-prev! find-prev!}))
 
+;; --- Autocomplete Popup & Controller ---
+
+(defn- create-autocomplete-renderer []
+  (let [font-mono (Font. "Consolas" Font/PLAIN 12)
+        bg-selected (Color. 220 235 252)
+        fg-selected (Color. 0 0 0)
+        bg-normal Color/WHITE
+        fg-special (Color. 130 30 150)
+        fg-builtin (Color. 0 90 180)
+        fg-user (Color. 20 120 40)
+        fg-default (Color. 40 40 40)]
+    (proxy [DefaultListCellRenderer] []
+      (getListCellRendererComponent [list value index isSelected cellHasFocus]
+        (let [c (proxy-super getListCellRendererComponent list value index isSelected cellHasFocus)]
+          (when (map? value)
+            (let [{:keys [symbol category]} value
+                  badge (case category
+                          :special " [special]"
+                          :builtin " [builtin]"
+                          :user    " [user]"
+                          "")]
+              (.setText c (str symbol badge))
+              (.setFont c font-mono)
+              (if isSelected
+                (do
+                  (.setBackground c bg-selected)
+                  (.setForeground c fg-selected))
+                (do
+                  (.setBackground c bg-normal)
+                  (.setForeground c (case category
+                                      :special fg-special
+                                      :builtin fg-builtin
+                                      :user    fg-user
+                                      fg-default))))))
+          c)))))
+
+(defn dismiss-autocomplete!
+  "Closes the active autocomplete popup if visible and clears state."
+  [active-popup-atom]
+  (when-let [{:keys [popup]} @active-popup-atom]
+    (try (.setVisible ^JPopupMenu popup false) (catch Exception _ nil))
+    (reset! active-popup-atom nil)))
+
+(defn commit-autocomplete!
+  "Inserts the currently selected candidate from the active autocomplete popup into the editor."
+  [active-popup-atom]
+  (when-let [{:keys [popup list start editor status-fn highlight-fn dirty-fn]} @active-popup-atom]
+    (try (.setVisible ^JPopupMenu popup false) (catch Exception _ nil))
+    (reset! active-popup-atom nil)
+    (when-let [selected (.getSelectedValue ^JList list)]
+      (let [sym (:symbol selected)
+            doc (.getDocument editor)
+            text (.getText doc 0 (.getLength doc))
+            caret (.getCaretPosition editor)
+            prefix-info (syntax/get-symbol-prefix-at-pos text caret)
+            replace-end (max (int caret) (int (:word-end prefix-info)))]
+        (.setSelectionStart editor (int start))
+        (.setSelectionEnd editor (int replace-end))
+        (.replaceSelection editor sym)
+        (.setCaretPosition editor (+ (int start) (count sym)))
+        (when dirty-fn (dirty-fn))
+        (when highlight-fn (highlight-fn))
+        (when status-fn (status-fn (str "Completed: " sym)))
+        (.requestFocusInWindow editor)))))
+
+(defn move-popup-selection!
+  "Moves selection index in active autocomplete popup list by `delta`."
+  [active-popup-atom delta]
+  (when-let [{:keys [list model]} @active-popup-atom]
+    (let [cnt (.getSize ^DefaultListModel model)
+          cur (.getSelectedIndex ^JList list)
+          next-idx (cond
+                     (neg? cur) 0
+                     :else (max 0 (min (dec cnt) (+ cur delta))))]
+      (when (pos? cnt)
+        (.setSelectedIndex ^JList list next-idx)
+        (.ensureIndexIsVisible ^JList list next-idx)))))
+
+(defn update-autocomplete-filter!
+  "Dynamically updates candidates in the open popup as user continues typing or deletes."
+  [active-popup-atom]
+  (when-let [{:keys [popup list model start editor]} @active-popup-atom]
+    (when (.isVisible ^JPopupMenu popup)
+      (let [doc (.getDocument editor)
+            text (.getText doc 0 (.getLength doc))
+            caret (.getCaretPosition editor)]
+        (if (< caret start)
+          (dismiss-autocomplete! active-popup-atom)
+          (let [prefix-info (syntax/get-symbol-prefix-at-pos text caret)]
+            (if (or (not= (:start prefix-info) start)
+                    (and (empty? (:prefix prefix-info)) (< caret start)))
+              (dismiss-autocomplete! active-popup-atom)
+              (let [candidates (syntax/get-autocomplete-candidates (:prefix prefix-info) text caret)]
+                (if (empty? candidates)
+                  (dismiss-autocomplete! active-popup-atom)
+                  (do
+                    (.clear ^DefaultListModel model)
+                    (doseq [c candidates]
+                      (.addElement ^DefaultListModel model c))
+                    (.setSelectedIndex ^JList list 0)
+                    (.ensureIndexIsVisible ^JList list 0)))))))))))
+
+(defn show-autocomplete-popup!
+  "Builds and displays a scrollable completion popup beneath the caret in `editor`."
+  [^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty!]
+  (dismiss-autocomplete! active-popup-atom)
+  (let [popup (JPopupMenu.)
+        _ (.setBorder popup (BorderFactory/createLineBorder (Color. 180 180 180) 1))
+        model (DefaultListModel.)
+        _ (doseq [c candidates] (.addElement model c))
+        list (JList. model)
+        _ (.setCellRenderer list (create-autocomplete-renderer))
+        _ (.setSelectionMode list ListSelectionModel/SINGLE_SELECTION)
+        _ (.setSelectedIndex list 0)
+        _ (.setFocusable list false)
+        scroll (JScrollPane. list ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
+        _ (.setBorder scroll (BorderFactory/createEmptyBorder))
+        _ (.setPreferredSize scroll (Dimension. 240 180))
+        _ (.add popup scroll)
+        caret (.getCaretPosition editor)
+        r (try
+            (if-let [rect (.modelToView2D editor (int caret))]
+              rect
+              (.modelToView editor (int caret)))
+            (catch Exception _ nil))
+        x (if r (int (.getX r)) 0)
+        y (if r (int (+ (.getY r) (.getHeight r))) 0)
+        state {:popup popup
+               :list list
+               :model model
+               :start start
+               :word-end word-end
+               :status-fn status-fn
+               :highlight-fn highlight-now!
+               :dirty-fn update-dirty!
+               :editor editor}]
+    (reset! active-popup-atom state)
+    (.addMouseListener list
+      (proxy [MouseAdapter] []
+        (mouseClicked [^MouseEvent e]
+          (when (= (.getClickCount e) 2)
+            (commit-autocomplete! active-popup-atom)))))
+    (try
+      (.show popup editor x y)
+      (catch Exception _ nil))
+    (.requestFocusInWindow editor)))
+
+(defn trigger-autocomplete!
+  "Triggers autocomplete at the caret position in `editor`.
+   - 0 matches: notifies status bar.
+   - 1 match: immediately auto-completes and updates dirty state.
+   - >1 matches: shows popup list beneath caret."
+  ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty!]
+   (let [doc (.getDocument editor)
+         text (.getText doc 0 (.getLength doc))
+         caret (.getCaretPosition editor)
+         prefix-info (syntax/get-symbol-prefix-at-pos text caret)
+         prefix (:prefix prefix-info)
+         start (:start prefix-info)
+         word-end (:word-end prefix-info)
+         candidates (syntax/get-autocomplete-candidates prefix text caret)]
+     (cond
+       (empty? candidates)
+       (do
+         (dismiss-autocomplete! active-popup-atom)
+         (if (str/blank? prefix)
+           (status-fn "No completions available.")
+           (status-fn (format "No completions found for '%s'" prefix)))
+         (try (.. Toolkit getDefaultToolkit beep) (catch Exception _ nil))
+         :no-match)
+
+       (= (count candidates) 1)
+       (let [sym (:symbol (first candidates))]
+         (dismiss-autocomplete! active-popup-atom)
+         (.setSelectionStart editor (int start))
+         (.setSelectionEnd editor (int word-end))
+         (.replaceSelection editor sym)
+         (.setCaretPosition editor (+ (int start) (count sym)))
+         (when update-dirty! (update-dirty!))
+         (when highlight-now! (highlight-now!))
+         (status-fn (str "Completed: " sym))
+         :single-match)
+
+       :else
+       (do
+         (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty!)
+         :multi-match)))))
+
+(defn setup-autocomplete-keys!
+  "Installs key and focus listeners on `editor` to control autocomplete popup navigation and commits."
+  [^JTextComponent editor active-popup-atom]
+  (.addKeyListener editor
+    (proxy [KeyAdapter] []
+      (keyPressed [^KeyEvent e]
+        (when-let [st @active-popup-atom]
+          (when (.isVisible ^JPopupMenu (:popup st))
+            (let [code (.getKeyCode e)]
+              (cond
+                (or (= code KeyEvent/VK_ENTER) (= code KeyEvent/VK_TAB))
+                (do
+                  (.consume e)
+                  (commit-autocomplete! active-popup-atom))
+
+                (= code KeyEvent/VK_ESCAPE)
+                (do
+                  (.consume e)
+                  (dismiss-autocomplete! active-popup-atom))
+
+                (= code KeyEvent/VK_UP)
+                (do
+                  (.consume e)
+                  (move-popup-selection! active-popup-atom -1))
+
+                (= code KeyEvent/VK_DOWN)
+                (do
+                  (.consume e)
+                  (move-popup-selection! active-popup-atom 1))
+
+                (= code KeyEvent/VK_PAGE_UP)
+                (do
+                  (.consume e)
+                  (move-popup-selection! active-popup-atom -6))
+
+                (= code KeyEvent/VK_PAGE_DOWN)
+                (do
+                  (.consume e)
+                  (move-popup-selection! active-popup-atom 6))
+
+                :else nil)))))
+
+      (keyReleased [^KeyEvent e]
+        (when-let [st @active-popup-atom]
+          (when (.isVisible ^JPopupMenu (:popup st))
+            (let [code (.getKeyCode e)]
+              (when-not (contains? #{KeyEvent/VK_UP KeyEvent/VK_DOWN KeyEvent/VK_PAGE_UP KeyEvent/VK_PAGE_DOWN
+                                     KeyEvent/VK_ENTER KeyEvent/VK_TAB KeyEvent/VK_ESCAPE
+                                     KeyEvent/VK_SHIFT KeyEvent/VK_CONTROL KeyEvent/VK_ALT KeyEvent/VK_META}
+                                   code)
+                (update-autocomplete-filter! active-popup-atom)))))))))
+
 (defn setup-editor-context-menu!
   "Attaches a right-click context menu to the editor with navigation, refactoring, formatting, and edit actions."
   ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! find-fn! replace-fn!]
-   (setup-editor-context-menu! editor jump-fn! rename-fn! doc-fn! comment-fn! nil nil find-fn! replace-fn!))
+   (setup-editor-context-menu! editor jump-fn! rename-fn! doc-fn! comment-fn! nil nil nil find-fn! replace-fn!))
   ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! find-fn! replace-fn!]
+   (setup-editor-context-menu! editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! nil find-fn! replace-fn!))
+  ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! autocomplete-fn! find-fn! replace-fn!]
    (let [popup (JPopupMenu.)
          item-jump (JMenuItem. "Jump to Definition (F12)")
          item-rename (JMenuItem. "Rename Symbol... (Shift+F6)")
          item-doc (JMenuItem. "Quick Documentation (Ctrl+Q)")
+         item-autocomplete (JMenuItem. "Autocomplete (Ctrl+Space)")
          item-format-all (JMenuItem. "Format All (Ctrl+Shift+F)")
          item-format-sel (JMenuItem. "Format Selection (Ctrl+Alt+F)")
          item-comment (JMenuItem. "Toggle Comment (Ctrl+/)")
@@ -827,6 +1071,7 @@
      (.addActionListener item-jump (proxy [ActionListener] [] (actionPerformed [e] (when jump-fn! (jump-fn!)))))
      (.addActionListener item-rename (proxy [ActionListener] [] (actionPerformed [e] (when rename-fn! (rename-fn!)))))
      (.addActionListener item-doc (proxy [ActionListener] [] (actionPerformed [e] (when doc-fn! (doc-fn!)))))
+     (.addActionListener item-autocomplete (proxy [ActionListener] [] (actionPerformed [e] (when autocomplete-fn! (autocomplete-fn!)))))
      (.addActionListener item-format-all (proxy [ActionListener] [] (actionPerformed [e] (if format-all-fn! (format-all-fn!) (format-all! editor)))))
      (.addActionListener item-format-sel (proxy [ActionListener] [] (actionPerformed [e] (if format-sel-fn! (format-sel-fn!) (format-selection! editor)))))
      (.addActionListener item-comment (proxy [ActionListener] [] (actionPerformed [e] (when comment-fn! (comment-fn!)))))
@@ -840,6 +1085,7 @@
      (.add popup item-jump)
      (.add popup item-rename)
      (.add popup item-doc)
+     (.add popup item-autocomplete)
      (.addSeparator popup)
      (.add popup item-format-all)
      (.add popup item-format-sel)
@@ -1075,7 +1321,8 @@
         fc (JFileChooser.)
         _ (.setFileFilter fc (javax.swing.filechooser.FileNameExtensionFilter. "Clojure files (*.clj, *.cljc, *.edn)" (into-array ["clj" "cljc" "edn"])))
 
-        undo-mgr (setup-undo! editor)]
+        undo-mgr (setup-undo! editor)
+        active-popup (atom nil)]
 
     ;; --- Setup Fonts ---
     (letfn [(apply-font! [sz]
@@ -1213,7 +1460,10 @@
                       (highlight-now!))
 
                     (quick-doc-action! []
-                      (show-quick-doc! frame editor))]
+                      (show-quick-doc! frame editor))
+
+                    (autocomplete-action! []
+                      (trigger-autocomplete! editor set-status! active-popup highlight-now! update-dirty!))]
 
               (let [find-ctrl (create-find-replace-panel editor highlight-now! update-title! set-status!)
                     find-panel (:panel find-ctrl)
@@ -1283,8 +1533,9 @@
                 (setup-bracket-matching! editor bracket-info)
                 (setup-auto-brackets! editor)
                 (setup-editor-keys! editor comment-action!)
+                (setup-autocomplete-keys! editor active-popup)
 
-                ;; Editor shortcuts for Run Definitions, Jump to Definition, Rename, Quick Doc, Find/Replace, Escape
+                ;; Editor shortcuts for Run Definitions, Jump to Definition, Rename, Quick Doc, Autocomplete, Find/Replace, Escape
                 (let [im (.getInputMap editor)
                       am (.getActionMap editor)]
                   (.put im (KeyStroke/getKeyStroke "F5") "run-definitions")
@@ -1310,6 +1561,13 @@
                   (.put am "quick-doc"
                     (proxy [javax.swing.AbstractAction] []
                       (actionPerformed [e] (quick-doc-action!))))
+
+                  ;; Autocomplete (Ctrl+Space)
+                  (.put im (KeyStroke/getKeyStroke "control SPACE") "autocomplete")
+                  (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SPACE KeyEvent/CTRL_DOWN_MASK) "autocomplete")
+                  (.put am "autocomplete"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e] (autocomplete-action!))))
 
                   (.put im (KeyStroke/getKeyStroke "control F") "open-find")
                   (.put am "open-find"
@@ -1352,7 +1610,7 @@
                           (close-find!)
                           (stop-current-eval!))))))
 
-                (setup-editor-context-menu! editor jump-action! rename-action! quick-doc-action! comment-action! format-all-action! format-selection-action! open-find! open-replace!)
+                (setup-editor-context-menu! editor jump-action! rename-action! quick-doc-action! comment-action! format-all-action! format-selection-action! autocomplete-action! open-find! open-replace!)
 
                 (.. editor getDocument (addDocumentListener
                   (proxy [DocumentListener] []
@@ -1420,6 +1678,7 @@
                       (close-window! []
                         (if (= (prompt-save-if-dirty!) :proceed)
                           (do
+                            (dismiss-autocomplete! active-popup)
                             (swap! active-windows dissoc frame)
                             (.dispose frame)
                             (when (empty? @active-windows)
@@ -1520,6 +1779,7 @@
                       item-jump (JMenuItem. "Jump to Definition")
                       item-rename (JMenuItem. "Rename Symbol...")
                       item-doc (JMenuItem. "Quick Documentation")
+                      item-autocomplete (JMenuItem. "Autocomplete")
                       item-format-all (JMenuItem. "Format All")
                       item-format-sel (JMenuItem. "Format Selection")
                       item-comment (JMenuItem. "Toggle Comment")
@@ -1535,6 +1795,7 @@
                             (.setAccelerator item-jump (KeyStroke/getKeyStroke "F12"))
                             (.setAccelerator item-rename (KeyStroke/getKeyStroke "shift F6"))
                             (.setAccelerator item-doc (KeyStroke/getKeyStroke "control Q"))
+                            (.setAccelerator item-autocomplete (KeyStroke/getKeyStroke "control SPACE"))
                             (.setAccelerator item-format-all (KeyStroke/getKeyStroke "control shift F"))
                             (.setAccelerator item-format-sel (KeyStroke/getKeyStroke "control alt F"))
                             (.setAccelerator item-comment (KeyStroke/getKeyStroke "control SLASH"))
@@ -1550,6 +1811,7 @@
                             (.addActionListener item-jump (proxy [ActionListener] [] (actionPerformed [e] (jump-action!))))
                             (.addActionListener item-rename (proxy [ActionListener] [] (actionPerformed [e] (rename-action!))))
                             (.addActionListener item-doc (proxy [ActionListener] [] (actionPerformed [e] (quick-doc-action!))))
+                            (.addActionListener item-autocomplete (proxy [ActionListener] [] (actionPerformed [e] (autocomplete-action!))))
                             (.addActionListener item-format-all (proxy [ActionListener] [] (actionPerformed [e] (format-all-action!))))
                             (.addActionListener item-format-sel (proxy [ActionListener] [] (actionPerformed [e] (format-selection-action!))))
                             (.addActionListener item-comment (proxy [ActionListener] [] (actionPerformed [e] (comment-action!))))
@@ -1567,6 +1829,7 @@
                             (.add menu-edit item-jump)
                             (.add menu-edit item-rename)
                             (.add menu-edit item-doc)
+                            (.add menu-edit item-autocomplete)
                             (.addSeparator menu-edit)
                             (.add menu-edit item-format-all)
                             (.add menu-edit item-format-sel)

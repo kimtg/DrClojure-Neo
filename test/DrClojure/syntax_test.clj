@@ -448,4 +448,120 @@
       ;; (defn a [] \n 1) should remain unindented (not touched)
       (is (= expected formatted)))))
 
+;; --- Autocomplete Tests ---
+
+(deftest find-buffer-definitions-test
+  (testing "Extracts def, defn, defmacro, defonce, defrecord, etc."
+    (let [code (str "(ns my.app)\n"
+                    "(def global-config {:port 8080})\n"
+                    "(defn calculate-total [items]\n"
+                    "  (reduce + items))\n"
+                    "(defn- private-helper [x] (* x 2))\n"
+                    "(defmacro with-timer [& body] `(time (do ~@body)))\n"
+                    "(defonce server-state (atom nil))\n"
+                    "(defrecord Person [name age])\n"
+                    ";; (defn commented-out-fn [x] x)\n")]
+      (is (= #{"global-config" "calculate-total" "private-helper" "with-timer" "server-state" "Person"}
+             (syntax/find-buffer-definitions code)))))
+
+  (testing "Handles type hints and metadata tags on definitions"
+    (let [code "(defn ^String greet [^String name] (str \"Hello \" name))\n(def ^:dynamic *debug-mode* false)"]
+      (is (= #{"greet" "*debug-mode*"}
+             (syntax/find-buffer-definitions code)))))
+
+  (testing "Returns empty set on empty text or nil"
+    (is (= #{} (syntax/find-buffer-definitions "")))
+    (is (= #{} (syntax/find-buffer-definitions nil)))
+    (is (= #{} (syntax/find-buffer-definitions "   \n\t  ")))))
+
+(deftest get-symbol-prefix-at-pos-test
+  (testing "Extracts prefix right after delimiter"
+    (let [text "(pri"
+          info (syntax/get-symbol-prefix-at-pos text 4)]
+      (is (= "pri" (:prefix info)))
+      (is (= 1 (:start info)))
+      (is (= 4 (:end info)))
+      (is (= 4 (:word-end info)))))
+
+  (testing "Extracts prefix inside complex buffer"
+    (let [text "(defn foo [x]\n  (map"
+          pos (.length text)
+          info (syntax/get-symbol-prefix-at-pos text pos)]
+      (is (= "map" (:prefix info)))
+      (is (= (- pos 3) (:start info)))
+      (is (= pos (:end info)))))
+
+  (testing "Empty prefix when cursor is immediately after whitespace or delimiter"
+    (let [info1 (syntax/get-symbol-prefix-at-pos "( " 2)
+          info2 (syntax/get-symbol-prefix-at-pos "(" 1)
+          info3 (syntax/get-symbol-prefix-at-pos "" 0)]
+      (is (= "" (:prefix info1)))
+      (is (= 2 (:start info1)))
+      (is (= "" (:prefix info2)))
+      (is (= 1 (:start info2)))
+      (is (= "" (:prefix info3)))
+      (is (= 0 (:start info3)))))
+
+  (testing "Prefix with Clojure identifier symbols (+, -, ?, !, /, .)"
+    (let [info-plus (syntax/get-symbol-prefix-at-pos "(+" 2)
+          info-pred (syntax/get-symbol-prefix-at-pos "(empty?" 7)
+          info-bang (syntax/get-symbol-prefix-at-pos "(swap!" 6)
+          info-ns (syntax/get-symbol-prefix-at-pos "(str/blank?" 11)]
+      (is (= "+" (:prefix info-plus)))
+      (is (= "empty?" (:prefix info-pred)))
+      (is (= "swap!" (:prefix info-bang)))
+      (is (= "str/blank?" (:prefix info-ns)))))
+
+  (testing "Calculates word-end for caret in middle of word"
+    (let [text "(println-str \"hi\")"
+          ;; caret at 4: "(pri|ntln-str \"hi\")"
+          info (syntax/get-symbol-prefix-at-pos text 4)]
+      (is (= "pri" (:prefix info)))
+      (is (= 1 (:start info)))
+      (is (= 4 (:end info)))
+      (is (= 12 (:word-end info))))))
+
+(deftest get-autocomplete-candidates-test
+  (testing "Matches special forms starting with prefix"
+    (let [candidates (syntax/get-autocomplete-candidates "def")]
+      (is (seq candidates))
+      (let [symbols (set (map :symbol candidates))
+            categories (set (map :category candidates))]
+        (is (contains? symbols "defn"))
+        (is (contains? symbols "defmacro"))
+        (is (contains? symbols "def"))
+        (is (contains? categories :special)))))
+
+  (testing "Matches core built-ins starting with prefix"
+    (let [candidates (syntax/get-autocomplete-candidates "pri")]
+      (is (seq candidates))
+      (let [symbols (set (map :symbol candidates))]
+        (is (contains? symbols "println"))
+        (is (contains? symbols "printf"))
+        (is (contains? symbols "print"))
+        ;; Starts-with check: must match case-insensitively at start of symbol
+        (is (every? #(clojure.string/starts-with? (clojure.string/lower-case %) "pri") symbols)))))
+
+  (testing "Matches user-defined buffer symbols"
+    (let [buffer (str "(defn my-custom-calculator [x y]\n"
+                      "  (let [result (+ x y)]\n"
+                      "    result))\n")
+          candidates (syntax/get-autocomplete-candidates "my-custom" buffer)]
+      (is (seq candidates))
+      (let [top (first candidates)]
+        (is (= "my-custom-calculator" (:symbol top)))
+        (is (= :user (:category top))))))
+
+  (testing "Prioritizes user definitions and exact case matches"
+    (let [buffer "(defn PrintCustom [] nil)\n(defn printer-agent [] nil)"
+          candidates (syntax/get-autocomplete-candidates "print" buffer)
+          symbols (map :symbol candidates)]
+      ;; User symbols matching prefix appear first
+      (is (contains? (set (take 5 symbols)) "printer-agent"))))
+
+  (testing "Returns empty vector when no candidate matches prefix"
+    (let [candidates (syntax/get-autocomplete-candidates "zzzznonexistent123")]
+      (is (empty? candidates)))))
+
+
 

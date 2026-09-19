@@ -3,7 +3,7 @@
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
   (:import (java.awt.event KeyEvent)
-           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke)
+           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList)
            (javax.swing.text DefaultStyledDocument)))
 
 (deftest app-metadata-test
@@ -535,4 +535,98 @@
       (is (= (KeyStroke/getKeyStroke "control shift F") (.getAccelerator item-format-all)))
       (is (some? item-format-sel))
       (is (= (KeyStroke/getKeyStroke "control alt F") (.getAccelerator item-format-sel)))
+      (.dispose frame))))
+
+(deftest autocomplete-trigger-test
+  (testing "Single match auto-completes immediately without opening popup"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          dirty-called (atom false)
+          update-dirty! (fn [] (reset! dirty-called true))]
+      (.setText editor "(defrecor")
+      (.setCaretPosition editor 9)
+      (let [res (ui/trigger-autocomplete! editor status-fn popup-atom nil update-dirty!)]
+        (is (= :single-match res))
+        (is (= "(defrecord" (.getText editor)))
+        (is (= 10 (.getCaretPosition editor)))
+        (is (nil? @popup-atom))
+        (is @dirty-called)
+        (is (= "Completed: defrecord" @status-msg)))))
+
+  (testing "Single match with user-defined function"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          code "(defn calculate-surface-area [r] (* 4 3.14 r r))\n(calc"]
+      (.setText editor code)
+      (.setCaretPosition editor (.length code))
+      (let [res (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)]
+        (is (= :single-match res))
+        (is (= "(defn calculate-surface-area [r] (* 4 3.14 r r))\n(calculate-surface-area"
+               (.getText editor)))
+        (is (= "Completed: calculate-surface-area" @status-msg)))))
+
+  (testing "Multiple matches creates popup list and selects first candidate"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))]
+      (.setText editor "(pri")
+      (.setCaretPosition editor 4)
+      (let [res (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)]
+        (is (= :multi-match res))
+        (is (some? @popup-atom))
+        (let [{:keys [list model]} @popup-atom]
+          (is (> (.getSize model) 1))
+          (is (= 0 (.getSelectedIndex list))))
+        ;; Commit first candidate
+        (ui/commit-autocomplete! popup-atom)
+        (is (nil? @popup-atom))
+        (is (.startsWith (.getText editor) "(pri")))))
+
+  (testing "Zero matches reports no completions in status bar"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))]
+      (.setText editor "(xyznonexistent123")
+      (.setCaretPosition editor 18)
+      (let [res (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)]
+        (is (= :no-match res))
+        (is (nil? @popup-atom))
+        (is (= "No completions found for 'xyznonexistent123'" @status-msg)))))
+
+  (testing "Popup navigation and dismissal"
+    (let [editor (JTextPane.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))]
+      (.setText editor "(def")
+      (.setCaretPosition editor 4)
+      (ui/trigger-autocomplete! editor status-fn popup-atom nil nil)
+      (is (some? @popup-atom))
+      ;; Move down
+      (ui/move-popup-selection! popup-atom 1)
+      (is (= 1 (.getSelectedIndex ^JList (:list @popup-atom))))
+      ;; Move up
+      (ui/move-popup-selection! popup-atom -1)
+      (is (= 0 (.getSelectedIndex ^JList (:list @popup-atom))))
+      ;; Dismiss
+      (ui/dismiss-autocomplete! popup-atom)
+      (is (nil? @popup-atom)))))
+
+(deftest autocomplete-integration-and-menu-test
+  (testing "Edit menu has Autocomplete item with Ctrl+Space accelerator"
+    (let [frame (ui/create-ide nil)
+          menubar (.getJMenuBar frame)
+          edit-menu (.getMenu menubar 1)
+          item-count (.getItemCount edit-menu)
+          items (into {} (keep (fn [i] (when-let [it (.getItem edit-menu i)] [(.getText it) it]))
+                               (range item-count)))
+          item-auto (get items "Autocomplete")]
+      (is (some? item-auto))
+      (is (= (KeyStroke/getKeyStroke "control SPACE") (.getAccelerator item-auto)))
       (.dispose frame))))

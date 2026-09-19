@@ -478,6 +478,142 @@
           {:status :not-found
            :symbol sym-name})))))
 
+;; --- Autocomplete Candidate & Prefix Extraction ---
+
+(def all-core-builtins
+  "Cached set of all clojure.core public var names combined with syntax core-builtins."
+  (delay
+    (let [publics (try
+                    (set (map name (keys (ns-publics 'clojure.core))))
+                    (catch Exception _ #{}))]
+      (into core-builtins publics))))
+
+(defn find-buffer-definitions
+  "Extracts all symbols defined in `text` via top-level definition forms
+   (defn, def, defmacro, defmulti, defmethod, defonce, defprotocol, defrecord, deftype, etc.).
+   Returns a set of symbol names as strings."
+  [^String text]
+  (if (or (nil? text) (str/blank? text))
+    #{}
+    (let [tokens (vec (filter #(not= (first %) :comment) (tokenize text)))
+          n (count tokens)]
+      (loop [i 0
+             acc #{}]
+        (if (< i n)
+          (let [[tok-type s _] (nth tokens i)]
+            (if (and (= tok-type :bracket) (= (.charAt text s) \())
+              (if (< (inc i) n)
+                (let [[next-type next-s next-e] (nth tokens (inc i))
+                      sym-form (.substring text next-s next-e)]
+                  (if (def-forms sym-form)
+                    ;; Scan forward past metadata to find defined symbol
+                    (let [found (loop [j (+ i 2)]
+                                  (when (< j n)
+                                    (let [[t-type ts te] (nth tokens j)]
+                                      (cond
+                                        (= t-type :metatag) (recur (inc j))
+                                        (= t-type :symbol) (.substring text ts te)
+                                        :else nil))))]
+                      (if found
+                        (recur (inc i) (conj acc found))
+                        (recur (inc i) acc)))
+                    (recur (inc i) acc)))
+                (recur (inc i) acc))
+              (recur (inc i) acc)))
+          acc)))))
+
+(defn symbol-char?
+  "Returns true if `ch` is a valid character inside a Clojure symbol/identifier."
+  [ch]
+  (and (some? ch)
+       (not (Character/isWhitespace ^Character ch))
+       (not (contains? #{\( \) \[ \] \{ \} \" \' \` \~ \@ \^ \\ \, \; \:} ch))))
+
+(defn get-symbol-prefix-at-pos
+  "Extracts the symbol prefix immediately preceding `pos` in `text`, along with the
+   full symbol bounds covering the caret (for replacement).
+   Returns `{:prefix str, :start int, :end int, :word-end int}`.
+   - `:start` is where the prefix starts.
+   - `:end` is `pos` (where the prefix ends).
+   - `:word-end` is the end offset of the symbol word following `pos` (if any)."
+  [^String text pos]
+  (if (or (nil? text) (zero? (.length text)))
+    {:prefix "" :start 0 :end 0 :word-end 0}
+    (let [len (.length text)
+          pos (min len (max 0 (int (or pos 0))))
+          start (loop [i (dec pos)]
+                  (if (and (>= i 0) (symbol-char? (.charAt text i)))
+                    (recur (dec i))
+                    (inc i)))
+          prefix (.substring text start pos)
+          word-end (loop [j pos]
+                     (if (and (< j len) (symbol-char? (.charAt text j)))
+                       (recur (inc j))
+                       j))]
+      {:prefix prefix :start start :end pos :word-end word-end})))
+
+(defn get-autocomplete-candidates
+  "Returns a sorted vector of candidate maps:
+   `{:symbol str, :category (:special | :builtin | :user)}`
+   whose symbols start with `prefix`.
+   If `text` is provided, user-defined symbols and document symbols from `text`
+   are included under the `:user` category.
+   If `pos` is provided, the token covering `pos` (the active word being typed)
+   is excluded from document symbols."
+  ([^String prefix]
+   (get-autocomplete-candidates prefix nil nil))
+  ([^String prefix ^String text]
+   (get-autocomplete-candidates prefix text nil))
+  ([^String prefix ^String text pos]
+   (let [prefix (or prefix "")
+         prefix-lower (str/lower-case prefix)
+         pos-int (when (number? pos) (int pos))
+         user-defs (if text (find-buffer-definitions text) #{})
+         user-doc-syms (if text
+                         (let [tokens (tokenize text)]
+                           (set (keep (fn [[tok-type s e]]
+                                        (when (and (= tok-type :symbol)
+                                                   ;; Exclude token covering pos (the active word being typed)
+                                                   (not (and pos-int (<= s pos-int e)))
+                                                   ;; Exclude tokens identical to prefix
+                                                   (not= (.substring text s e) prefix))
+                                          (.substring text s e)))
+                                      tokens)))
+                         #{})
+        all-builtins @all-core-builtins
+        ;; Group user symbols (excluding known special-forms and builtins)
+        all-user (into (set user-defs)
+                       (remove #(or (contains? special-forms %)
+                                    (contains? all-builtins %))
+                               user-doc-syms))
+        ;; Candidate maps
+        special-maps (map (fn [s] {:symbol s :category :special}) special-forms)
+        builtin-maps (map (fn [s] {:symbol s :category :builtin}) all-builtins)
+        user-maps (map (fn [s] {:symbol s :category :user}) all-user)
+        ;; Deduplicate by symbol name, with priority :user > :special > :builtin
+        by-sym (reduce (fn [m c]
+                         (let [sym (:symbol c)
+                               prev (get m sym)]
+                           (cond
+                             (nil? prev) (assoc m sym c)
+                             (= (:category c) :user) (assoc m sym c)
+                             :else m)))
+                       {}
+                       (concat user-maps special-maps builtin-maps))
+        ;; Filter candidates matching prefix (case-insensitive starts-with)
+        matched (filter (fn [{:keys [symbol]}]
+                          (if (str/blank? prefix)
+                            true
+                            (str/starts-with? (str/lower-case symbol) prefix-lower)))
+                        (vals by-sym))]
+    (vec
+      (sort-by (fn [{:keys [symbol category]}]
+                 [(if (str/starts-with? symbol prefix) 0 1)
+                  (case category :user 0 :special 1 :builtin 2 3)
+                  (str/lower-case symbol)
+                  symbol])
+               matched)))))
+
 ;; --- Clojure Code Formatter ---
 
 (def body-indent-forms
