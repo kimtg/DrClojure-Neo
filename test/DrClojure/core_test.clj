@@ -3,7 +3,7 @@
             [DrClojure.core :as core]
             [DrClojure.ui :as ui])
   (:import (java.awt.event KeyEvent)
-           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList JTextArea)
+           (javax.swing JDialog JFrame JMenuItem JTextPane KeyStroke JPopupMenu JList JTextArea JTextField JComponent JLabel)
            (javax.swing.text DefaultStyledDocument)))
 
 (deftest app-metadata-test
@@ -490,7 +490,9 @@
 
 (deftest multi-window-exit-all-test
   (testing "File -> Exit safely disposes all open windows and calls exit-handler"
-    (let [orig-handler @ui/exit-handler
+    (let [orig-windows @ui/active-windows
+          _ (reset! ui/active-windows {})
+          orig-handler @ui/exit-handler
           exit-called? (atom false)
           _ (reset! ui/exit-handler (fn [] (reset! exit-called? true)))
           frame1 (ui/open-ide-window! nil)
@@ -508,6 +510,7 @@
         (is (true? @exit-called?))
         (finally
           (reset! ui/exit-handler orig-handler)
+          (reset! ui/active-windows orig-windows)
           (.dispose frame1)
           (.dispose frame2))))))
 
@@ -709,13 +712,171 @@
 
 (deftest autocomplete-integration-and-menu-test
   (testing "Edit menu has Autocomplete item with Ctrl+Space accelerator"
-    (let [frame (ui/create-ide nil)
-          menubar (.getJMenuBar frame)
-          edit-menu (.getMenu menubar 1)
-          item-count (.getItemCount edit-menu)
-          items (into {} (keep (fn [i] (when-let [it (.getItem edit-menu i)] [(.getText it) it]))
-                               (range item-count)))
-          item-auto (get items "Autocomplete")]
-      (is (some? item-auto))
-      (is (= (KeyStroke/getKeyStroke "control SPACE") (.getAccelerator item-auto)))
-      (.dispose frame))))
+    (let [frame (ui/create-ide nil)]
+      (try
+        (let [menubar (.getJMenuBar frame)
+              edit-menu (.getMenu menubar 1)
+              item-count (.getItemCount edit-menu)
+              items (into {} (keep (fn [i] (when-let [it (.getItem edit-menu i)] [(.getText it) it]))
+                                   (range item-count)))
+              item-auto (get items "Autocomplete")]
+          (is (some? item-auto))
+          (is (= (KeyStroke/getKeyStroke "control SPACE") (.getAccelerator item-auto))))
+        (finally
+          (.dispose frame)
+          (swap! ui/active-windows dissoc frame))))))
+
+(deftest autocomplete-repl-test
+  (testing "Single match auto-completes immediately in JTextField"
+    (let [input (JTextField.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))]
+      (.setText input "(defrecor")
+      (.setCaretPosition input 9)
+      (let [res (ui/trigger-autocomplete! input status-fn popup-atom nil nil)]
+        (is (= :single-match res))
+        (is (= "(defrecord" (.getText input)))
+        (is (= 10 (.getCaretPosition input)))
+        (is (nil? @popup-atom))
+        (is (= "Completed: defrecord" @status-msg)))))
+
+  (testing "Single match in JTextField completing user-defined function from editor buffer via extra-context"
+    (let [input (JTextField.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          editor-code "(defn compute-cube-unique-fn [x] (* x x x))"]
+      (.setText input "(compute-cube")
+      (.setCaretPosition input 13)
+      (let [res (ui/trigger-autocomplete! input status-fn popup-atom nil nil editor-code)]
+        (is (= :single-match res))
+        (is (= "(compute-cube-unique-fn" (.getText input)))
+        (is (= "Completed: compute-cube-unique-fn" @status-msg)))))
+
+  (testing "Multiple matches creates popup above prompt with live doc preview"
+    (let [input (JTextField.)
+          popup-atom (atom nil)
+          status-msg (atom nil)
+          status-fn (fn [msg] (reset! status-msg msg))
+          editor-code (str "(defn calculate-hypot [a b] (Math/sqrt (+ (* a a) (* b b))))\n"
+                           "(defn calculate-area [w h] (* w h))")]
+      (.setText input "(calc")
+      (.setCaretPosition input 5)
+      (let [res (ui/trigger-autocomplete! input status-fn popup-atom nil nil editor-code)]
+        (is (= :multi-match res))
+        (is (some? @popup-atom))
+        (let [{:keys [list model doc-area]} @popup-atom]
+          (is (= 2 (.getSize model)))
+          (is (instance? JTextArea doc-area))
+          (let [first-doc (.getText ^JTextArea doc-area)]
+            (is (.contains first-doc "calculate-area")))
+          ;; Move selection to calculate-hypot
+          (ui/move-popup-selection! popup-atom 1)
+          (let [second-doc (.getText ^JTextArea doc-area)]
+            (is (.contains second-doc "calculate-hypot")))
+          ;; Commit selected candidate
+          (ui/commit-autocomplete! popup-atom)
+          (is (nil? @popup-atom))
+          (is (= "(calculate-hypot" (.getText input)))))))
+
+  (testing "REPL input field bindings and context menu in create-ide"
+    (let [frame (ui/create-ide nil)]
+      (try
+        (let [content-pane (.getContentPane frame)
+              all-tfs (atom [])
+              collect (fn c [cmp]
+                        (when (instance? JTextField cmp)
+                          (swap! all-tfs conj cmp))
+                        (when (instance? java.awt.Container cmp)
+                          (doseq [child (.getComponents cmp)]
+                            (c child))))
+              _ (collect content-pane)
+              input-field (first (filter (fn [tf]
+                                           (when-let [p (.getParent tf)]
+                                             (some #(and (instance? JLabel %) (= (.getText ^JLabel %) " > "))
+                                                   (.getComponents p))))
+                                         @all-tfs))]
+          (is (some? input-field))
+          ;; Check input map has repl-autocomplete for Ctrl+Space and Tab
+          (let [im (.getInputMap input-field JComponent/WHEN_FOCUSED)]
+            (is (= "repl-autocomplete" (.get im (KeyStroke/getKeyStroke "control SPACE"))))
+            (is (= "repl-autocomplete" (.get im (KeyStroke/getKeyStroke "TAB")))))
+          ;; Check context menu exists and has Autocomplete item
+          (let [menu (.getComponentPopupMenu input-field)]
+            (is (some? menu))
+            (let [menu-items (into {} (keep (fn [i] (when-let [it (.getComponent menu i)]
+                                                      (when (instance? JMenuItem it)
+                                                        [(.getText ^JMenuItem it) it])))
+                                            (range (.getComponentCount menu))))]
+              (is (contains? menu-items "Autocomplete (Ctrl+Space)"))
+              (is (contains? menu-items "Clear")))))
+        (finally
+          (.dispose frame)
+          (swap! ui/active-windows dissoc frame))))))
+
+(deftest autocomplete-repl-key-precedence-test
+  (testing "Enter commits autocomplete without submitting to REPL evaluator"
+    (let [input (JTextField.)
+          popup-atom (atom nil)
+          committed? (atom false)
+          eval-executed? (atom false)
+          status-fn (fn [_] nil)]
+      (ui/setup-autocomplete-keys! input popup-atom)
+      (.addActionListener input
+        (proxy [java.awt.event.ActionListener] []
+          (actionPerformed [e]
+            (when-not (or @committed? (and @popup-atom (.isVisible ^JPopupMenu (:popup @popup-atom))))
+              (reset! eval-executed? true)))))
+      (.setText input "(pri")
+      (.setCaretPosition input 4)
+      (ui/trigger-autocomplete! input status-fn popup-atom nil nil nil committed?)
+      (is (some? @popup-atom))
+      ;; Simulate Enter key press
+      (let [enter-event (KeyEvent. input KeyEvent/KEY_PRESSED 0 0 KeyEvent/VK_ENTER \newline)]
+        (doseq [kl (.getKeyListeners input)]
+          (.keyPressed kl enter-event))
+        (is (.isConsumed enter-event))
+        (is (nil? @popup-atom))
+        (is (.startsWith (.getText input) "(pri"))
+        (is (false? @eval-executed?)))))
+
+  (testing "Up/Down arrows navigate autocomplete popup and do not navigate REPL history"
+    (let [input (JTextField.)
+          popup-atom (atom nil)
+          status-fn (fn [_] nil)
+          history-changed? (atom false)]
+      (ui/setup-autocomplete-keys! input popup-atom)
+      (.addKeyListener input
+        (proxy [java.awt.event.KeyAdapter] []
+          (keyPressed [e]
+            (when-not (or (.isConsumed e) @popup-atom)
+              (when (or (= (.getKeyCode e) KeyEvent/VK_UP) (= (.getKeyCode e) KeyEvent/VK_DOWN))
+                (reset! history-changed? true))))))
+      (.setText input "(pri")
+      (.setCaretPosition input 4)
+      (ui/trigger-autocomplete! input status-fn popup-atom nil nil)
+      (is (some? @popup-atom))
+      (let [down-event (KeyEvent. input KeyEvent/KEY_PRESSED 0 0 KeyEvent/VK_DOWN KeyEvent/CHAR_UNDEFINED)]
+        (doseq [kl (.getKeyListeners input)]
+          (.keyPressed kl down-event))
+        (is (.isConsumed down-event))
+        (is (= 1 (.getSelectedIndex ^JList (:list @popup-atom))))
+        (is (false? @history-changed?)))
+      (ui/dismiss-autocomplete! popup-atom)))
+
+  (testing "Escape dismisses autocomplete popup cleanly"
+    (let [input (JTextField.)
+          popup-atom (atom nil)
+          status-fn (fn [_] nil)]
+      (ui/setup-autocomplete-keys! input popup-atom)
+      (.setText input "(pri")
+      (.setCaretPosition input 4)
+      (ui/trigger-autocomplete! input status-fn popup-atom nil nil)
+      (is (some? @popup-atom))
+      (let [esc-event (KeyEvent. input KeyEvent/KEY_PRESSED 0 0 KeyEvent/VK_ESCAPE KeyEvent/CHAR_UNDEFINED)]
+        (doseq [kl (.getKeyListeners input)]
+          (.keyPressed kl esc-event))
+        (is (.isConsumed esc-event))
+        (is (nil? @popup-atom))
+        (is (= "(pri" (.getText input)))))))

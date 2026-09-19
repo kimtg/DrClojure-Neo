@@ -657,7 +657,33 @@
 
   (testing "Returns empty vector when no candidate matches prefix"
     (let [candidates (syntax/get-autocomplete-candidates "zzzznonexistent123")]
-      (is (empty? candidates)))))
+      (is (empty? candidates))))
+
+  (testing "Matches user definitions from extra-context (editor buffer for REPL)"
+    (let [editor-buffer "(defn compute-factorial [n] (if (<= n 1) 1 (* n (compute-factorial (dec n)))))\n"
+          repl-input "(comp"
+          ;; extra-context as string
+          candidates-str (syntax/get-autocomplete-candidates "comp" repl-input 5 editor-buffer)
+          top-str (first (filter #(= (:symbol %) "compute-factorial") candidates-str))]
+      (is (some? top-str))
+      (is (= :user (:category top-str)))
+      ;; extra-context as zero-arg fn
+      (let [candidates-fn (syntax/get-autocomplete-candidates "comp" repl-input 5 (constantly editor-buffer))
+            top-fn (first (filter #(= (:symbol %) "compute-factorial") candidates-fn))]
+        (is (some? top-fn))
+        (is (= :user (:category top-fn))))))
+
+  (testing "Matches dynamically defined runtime namespace vars"
+    (let [test-sym-name "my-dynamic-test-var-12345"
+          test-sym (symbol test-sym-name)]
+      (intern *ns* test-sym "test-value")
+      (try
+        (let [candidates (syntax/get-autocomplete-candidates "my-dynamic-test-var")]
+          (is (some #(= (:symbol %) test-sym-name) candidates))
+          (let [match (first (filter #(= (:symbol %) test-sym-name) candidates))]
+            (is (= :user (:category match)))))
+        (finally
+          (ns-unmap *ns* test-sym))))))
 
 
 

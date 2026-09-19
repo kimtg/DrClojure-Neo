@@ -747,60 +747,80 @@
    If `text` is provided, user-defined symbols and document symbols from `text`
    are included under the `:user` category.
    If `pos` is provided, the token covering `pos` (the active word being typed)
-   is excluded from document symbols."
+   is excluded from document symbols.
+   If `extra-context` is provided (string or zero-arg fn), user definitions and
+   tokens from it are also included."
   ([^String prefix]
-   (get-autocomplete-candidates prefix nil nil))
+   (get-autocomplete-candidates prefix nil nil nil))
   ([^String prefix ^String text]
-   (get-autocomplete-candidates prefix text nil))
+   (get-autocomplete-candidates prefix text nil nil))
   ([^String prefix ^String text pos]
-   (let [prefix (or prefix "")
+   (get-autocomplete-candidates prefix text pos nil))
+  ([^String prefix ^String text pos extra-context]
+   (let [extra-text (if (fn? extra-context) (extra-context) extra-context)
+         prefix (or prefix "")
          prefix-lower (str/lower-case prefix)
          pos-int (when (number? pos) (int pos))
-         user-defs (if text (find-buffer-definitions text) #{})
-         user-doc-syms (if text
-                         (let [tokens (tokenize text)]
-                           (set (keep (fn [[tok-type s e]]
-                                        (when (and (= tok-type :symbol)
-                                                   ;; Exclude token covering pos (the active word being typed)
-                                                   (not (and pos-int (<= s pos-int e)))
-                                                   ;; Exclude tokens identical to prefix
-                                                   (not= (.substring text s e) prefix))
-                                          (.substring text s e)))
-                                      tokens)))
-                         #{})
-        all-builtins @all-core-builtins
-        ;; Group user symbols (excluding known special-forms and builtins)
-        all-user (into (set user-defs)
-                       (remove #(or (contains? special-forms %)
-                                    (contains? all-builtins %))
-                               user-doc-syms))
-        ;; Candidate maps
-        special-maps (map (fn [s] {:symbol s :category :special}) special-forms)
-        builtin-maps (map (fn [s] {:symbol s :category :builtin}) all-builtins)
-        user-maps (map (fn [s] {:symbol s :category :user}) all-user)
-        ;; Deduplicate by symbol name, with priority :user > :special > :builtin
-        by-sym (reduce (fn [m c]
-                         (let [sym (:symbol c)
-                               prev (get m sym)]
-                           (cond
-                             (nil? prev) (assoc m sym c)
-                             (= (:category c) :user) (assoc m sym c)
-                             :else m)))
-                       {}
-                       (concat user-maps special-maps builtin-maps))
-        ;; Filter candidates matching prefix (case-insensitive starts-with)
-        matched (filter (fn [{:keys [symbol]}]
-                          (if (str/blank? prefix)
-                            true
-                            (str/starts-with? (str/lower-case symbol) prefix-lower)))
-                        (vals by-sym))]
-    (vec
-      (sort-by (fn [{:keys [symbol category]}]
-                 [(if (str/starts-with? symbol prefix) 0 1)
-                  (case category :user 0 :special 1 :builtin 2 3)
-                  (str/lower-case symbol)
-                  symbol])
-               matched)))))
+         user-defs-text (if text (find-buffer-definitions text) #{})
+         user-defs-extra (if (and (string? extra-text) (not (str/blank? extra-text)))
+                           (find-buffer-definitions extra-text)
+                           #{})
+         user-defs (into (set user-defs-text) user-defs-extra)
+         tokens-text (if text
+                       (keep (fn [[tok-type s e]]
+                               (when (and (= tok-type :symbol)
+                                          (not (and pos-int (<= s pos-int e)))
+                                          (not= (.substring text s e) prefix))
+                                 (.substring text s e)))
+                             (tokenize text))
+                       [])
+         tokens-extra (if (and (string? extra-text) (not (str/blank? extra-text)))
+                        (keep (fn [[tok-type s e]]
+                                (when (and (= tok-type :symbol)
+                                           (not= (.substring extra-text s e) prefix))
+                                  (.substring extra-text s e)))
+                              (tokenize extra-text))
+                        [])
+         user-doc-syms (into (set tokens-text) tokens-extra)
+         runtime-user (try
+                        (let [curr-ns (or *ns* (find-ns 'user))]
+                          (if curr-ns
+                            (set (map name (keys (ns-publics curr-ns))))
+                            #{}))
+                        (catch Exception _ #{}))
+         all-builtins @all-core-builtins
+         ;; Group user symbols (excluding known special-forms and builtins)
+         all-user (into (into (set user-defs) runtime-user)
+                        (remove #(or (contains? special-forms %)
+                                     (contains? all-builtins %))
+                                user-doc-syms))
+         ;; Candidate maps
+         special-maps (map (fn [s] {:symbol s :category :special}) special-forms)
+         builtin-maps (map (fn [s] {:symbol s :category :builtin}) all-builtins)
+         user-maps (map (fn [s] {:symbol s :category :user}) all-user)
+         ;; Deduplicate by symbol name, with priority :user > :special > :builtin
+         by-sym (reduce (fn [m c]
+                          (let [sym (:symbol c)
+                                prev (get m sym)]
+                            (cond
+                              (nil? prev) (assoc m sym c)
+                              (= (:category c) :user) (assoc m sym c)
+                              :else m)))
+                        {}
+                        (concat user-maps special-maps builtin-maps))
+         ;; Filter candidates matching prefix (case-insensitive starts-with)
+         matched (filter (fn [{:keys [symbol]}]
+                           (if (str/blank? prefix)
+                             true
+                             (str/starts-with? (str/lower-case symbol) prefix-lower)))
+                         (vals by-sym))]
+     (vec
+       (sort-by (fn [{:keys [symbol category]}]
+                  [(if (str/starts-with? symbol prefix) 0 1)
+                   (case category :user 0 :special 1 :builtin 2 3)
+                   (str/lower-case symbol)
+                   symbol])
+                matched)))))
 
 ;; --- Clojure Code Formatter ---
 

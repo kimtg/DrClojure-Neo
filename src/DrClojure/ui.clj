@@ -12,7 +12,7 @@
                         JFileChooser JOptionPane JToolBar BorderFactory Box
                         SwingUtilities UIManager JDialog JViewport JComponent JCheckBox AbstractAction
                         JList DefaultListModel DefaultListCellRenderer ListSelectionModel ScrollPaneConstants)
-           (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType ListSelectionListener)
+           (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType ListSelectionListener PopupMenuListener)
            (javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent
                              DefaultStyledDocument AbstractDocument$DefaultDocumentEvent)
            (java.awt BorderLayout FlowLayout GridLayout Dimension Font Color Insets
@@ -867,9 +867,12 @@
 (defn commit-autocomplete!
   "Inserts the currently selected candidate from the active autocomplete popup into the editor."
   [active-popup-atom]
-  (when-let [{:keys [popup list start editor status-fn highlight-fn dirty-fn]} @active-popup-atom]
+  (when-let [{:keys [popup list start editor status-fn highlight-fn dirty-fn just-committed-atom]} @active-popup-atom]
     (try (.setVisible ^JPopupMenu popup false) (catch Exception _ nil))
     (reset! active-popup-atom nil)
+    (when just-committed-atom
+      (reset! just-committed-atom true)
+      (SwingUtilities/invokeLater #(reset! just-committed-atom false)))
     (when-let [selected (.getSelectedValue ^JList list)]
       (let [sym (:symbol selected)
             doc (.getDocument editor)
@@ -886,20 +889,28 @@
         (when status-fn (status-fn (str "Completed: " sym)))
         (.requestFocusInWindow editor)))))
 
-(defn- update-doc-preview! [^JTextArea doc-area candidate ^String text caret]
-  (when doc-area
-    (if candidate
-      (let [sym (:symbol candidate)
-            doc-info (syntax/get-symbol-doc sym text caret)
-            formatted (syntax/format-autocomplete-doc doc-info candidate)]
-        (.setText doc-area formatted)
-        (.setCaretPosition doc-area 0))
-      (.setText doc-area ""))))
+(defn- update-doc-preview!
+  ([^JTextArea doc-area candidate ^String text caret]
+   (update-doc-preview! doc-area candidate text caret nil))
+  ([^JTextArea doc-area candidate ^String text caret extra-context]
+   (when doc-area
+     (if candidate
+       (let [sym (:symbol candidate)
+             extra-text (if (fn? extra-context) (extra-context) extra-context)
+             doc-info-primary (syntax/get-symbol-doc sym text caret)
+             doc-info (if (and (= (:status doc-info-primary) :not-found) (seq extra-text))
+                        (let [sec (syntax/get-symbol-doc sym extra-text 0)]
+                          (if (not= (:status sec) :not-found) sec doc-info-primary))
+                        doc-info-primary)
+             formatted (syntax/format-autocomplete-doc doc-info candidate)]
+         (.setText doc-area formatted)
+         (.setCaretPosition doc-area 0))
+       (.setText doc-area "")))))
 
 (defn move-popup-selection!
   "Moves selection index in active autocomplete popup list by `delta`."
   [active-popup-atom delta]
-  (when-let [{:keys [list model doc-area editor]} @active-popup-atom]
+  (when-let [{:keys [list model doc-area editor extra-context]} @active-popup-atom]
     (let [cnt (.getSize ^DefaultListModel model)
           cur (.getSelectedIndex ^JList list)
           next-idx (cond
@@ -913,12 +924,12 @@
                 doc (.getDocument editor)
                 txt (.getText doc 0 (.getLength doc))
                 c (.getCaretPosition editor)]
-            (update-doc-preview! doc-area sel txt c)))))))
+            (update-doc-preview! doc-area sel txt c extra-context)))))))
 
 (defn update-autocomplete-filter!
   "Dynamically updates candidates in the open popup as user continues typing or deletes."
   [active-popup-atom]
-  (when-let [{:keys [popup list model doc-area start editor]} @active-popup-atom]
+  (when-let [{:keys [popup list model doc-area start editor extra-context]} @active-popup-atom]
     (when (.isVisible ^JPopupMenu popup)
       (let [doc (.getDocument editor)
             text (.getText doc 0 (.getLength doc))
@@ -929,7 +940,7 @@
             (if (or (not= (:start prefix-info) start)
                     (and (empty? (:prefix prefix-info)) (< caret start)))
               (dismiss-autocomplete! active-popup-atom)
-              (let [candidates (syntax/get-autocomplete-candidates (:prefix prefix-info) text caret)]
+              (let [candidates (syntax/get-autocomplete-candidates (:prefix prefix-info) text caret extra-context)]
                 (if (empty? candidates)
                   (dismiss-autocomplete! active-popup-atom)
                   (do
@@ -939,88 +950,125 @@
                     (.setSelectedIndex ^JList list 0)
                     (.ensureIndexIsVisible ^JList list 0)
                     (when doc-area
-                      (update-doc-preview! doc-area (first candidates) text caret))))))))))))
+                      (update-doc-preview! doc-area (first candidates) text caret extra-context))))))))))))
 
 (defn show-autocomplete-popup!
-  "Builds and displays a scrollable completion popup beneath the caret in `editor`.
+  "Builds and displays a scrollable completion popup beneath or above the caret in `editor`.
    Shows candidate list on the left and documentation preview on the right."
-  [^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty!]
-  (dismiss-autocomplete! active-popup-atom)
-  (let [popup (JPopupMenu.)
-        _ (.setBorder popup (BorderFactory/createLineBorder (Color. 180 180 180) 1))
-        model (DefaultListModel.)
-        _ (doseq [c candidates] (.addElement model c))
-        list (JList. model)
-        _ (.setCellRenderer list (create-autocomplete-renderer))
-        _ (.setSelectionMode list ListSelectionModel/SINGLE_SELECTION)
-        _ (.setSelectedIndex list 0)
-        _ (.setFocusable list false)
-        scroll-list (JScrollPane. list ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
-        _ (.setBorder scroll-list (BorderFactory/createMatteBorder 0 0 0 1 (Color. 220 220 220)))
-        _ (.setPreferredSize scroll-list (Dimension. 220 220))
-        doc-area (JTextArea.)
-        _ (.setEditable doc-area false)
-        _ (.setLineWrap doc-area true)
-        _ (.setWrapStyleWord doc-area true)
-        _ (.setFont doc-area (Font. "Consolas" Font/PLAIN 12))
-        _ (.setBackground doc-area (Color. 250 250 252))
-        _ (.setForeground doc-area (Color. 40 40 40))
-        _ (.setMargin doc-area (Insets. 6 8 6 8))
-        _ (.setFocusable doc-area false)
-        scroll-doc (JScrollPane. doc-area ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
-        _ (.setBorder scroll-doc (BorderFactory/createEmptyBorder))
-        _ (.setPreferredSize scroll-doc (Dimension. 400 220))
-        content-panel (JPanel. (BorderLayout.))
-        _ (.add content-panel scroll-list BorderLayout/WEST)
-        _ (.add content-panel scroll-doc BorderLayout/CENTER)
-        _ (.add popup content-panel)
-        caret (.getCaretPosition editor)
-        doc (.getDocument editor)
-        text (.getText doc 0 (.getLength doc))
-        _ (update-doc-preview! doc-area (first candidates) text caret)
-        _ (.addListSelectionListener list
-            (reify ListSelectionListener
-              (valueChanged [this e]
-                (when-not (.getValueIsAdjusting e)
-                  (let [sel (.getSelectedValue list)
-                        cur-doc (.getDocument editor)
-                        cur-txt (.getText cur-doc 0 (.getLength cur-doc))
-                        cur-caret (.getCaretPosition editor)]
-                    (update-doc-preview! doc-area sel cur-txt cur-caret))))))
-        r (try
-            (if-let [rect (.modelToView2D editor (int caret))]
-              rect
-              (.modelToView editor (int caret)))
-            (catch Exception _ nil))
-        x (if r (int (.getX r)) 0)
-        y (if r (int (+ (.getY r) (.getHeight r))) 0)
-        state {:popup popup
-               :list list
-               :model model
-               :doc-area doc-area
-               :start start
-               :word-end word-end
-               :status-fn status-fn
-               :highlight-fn highlight-now!
-               :dirty-fn update-dirty!
-               :editor editor}]
-    (reset! active-popup-atom state)
-    (.addMouseListener list
-      (proxy [MouseAdapter] []
-        (mouseClicked [^MouseEvent e]
-          (when (= (.getClickCount e) 2)
-            (commit-autocomplete! active-popup-atom)))))
-    (try
-      (.show popup editor x y)
-      (catch Exception _ nil))
-    (.requestFocusInWindow editor)))
+  ([^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty!]
+   (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! nil nil))
+  ([^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context]
+   (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context nil))
+  ([^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom]
+   (dismiss-autocomplete! active-popup-atom)
+   (let [popup (JPopupMenu.)
+         _ (.setBorder popup (BorderFactory/createLineBorder (Color. 180 180 180) 1))
+         model (DefaultListModel.)
+         _ (doseq [c candidates] (.addElement model c))
+         list (JList. model)
+         _ (.setCellRenderer list (create-autocomplete-renderer))
+         _ (.setSelectionMode list ListSelectionModel/SINGLE_SELECTION)
+         _ (.setSelectedIndex list 0)
+         _ (.setFocusable list false)
+         scroll-list (JScrollPane. list ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
+         _ (.setBorder scroll-list (BorderFactory/createMatteBorder 0 0 0 1 (Color. 220 220 220)))
+         _ (.setPreferredSize scroll-list (Dimension. 220 220))
+         doc-area (JTextArea.)
+         _ (.setEditable doc-area false)
+         _ (.setLineWrap doc-area true)
+         _ (.setWrapStyleWord doc-area true)
+         _ (.setFont doc-area (Font. "Consolas" Font/PLAIN 12))
+         _ (.setBackground doc-area (Color. 250 250 252))
+         _ (.setForeground doc-area (Color. 40 40 40))
+         _ (.setMargin doc-area (Insets. 6 8 6 8))
+         _ (.setFocusable doc-area false)
+         scroll-doc (JScrollPane. doc-area ScrollPaneConstants/VERTICAL_SCROLLBAR_AS_NEEDED ScrollPaneConstants/HORIZONTAL_SCROLLBAR_NEVER)
+         _ (.setBorder scroll-doc (BorderFactory/createEmptyBorder))
+         _ (.setPreferredSize scroll-doc (Dimension. 400 220))
+         content-panel (JPanel. (BorderLayout.))
+         _ (.add content-panel scroll-list BorderLayout/WEST)
+         _ (.add content-panel scroll-doc BorderLayout/CENTER)
+         _ (.add popup content-panel)
+         caret (.getCaretPosition editor)
+         doc (.getDocument editor)
+         text (.getText doc 0 (.getLength doc))
+         _ (update-doc-preview! doc-area (first candidates) text caret extra-context)
+         _ (.addListSelectionListener list
+             (reify ListSelectionListener
+               (valueChanged [this e]
+                 (when-not (.getValueIsAdjusting e)
+                   (let [sel (.getSelectedValue list)
+                         cur-doc (.getDocument editor)
+                         cur-txt (.getText cur-doc 0 (.getLength cur-doc))
+                         cur-caret (.getCaretPosition editor)]
+                     (update-doc-preview! doc-area sel cur-txt cur-caret extra-context))))))
+         r (try
+             (if-let [rect (.modelToView2D editor (int caret))]
+               rect
+               (.modelToView editor (int caret)))
+             (catch Exception _ nil))
+         x (if r (int (.getX r)) 0)
+         raw-y (if r (int (+ (.getY r) (.getHeight r))) 0)
+         popup-height 230
+         pt (try (.getLocationOnScreen editor) (catch Exception _ nil))
+         popup-y (if (or (instance? JTextField editor)
+                         (and pt r
+                              (let [screen-bounds (try (.. editor getGraphicsConfiguration getBounds)
+                                                       (catch Exception _ nil))
+                                    screen-insets (try (.. Toolkit getDefaultToolkit (getScreenInsets (.getGraphicsConfiguration editor)))
+                                                       (catch Exception _ (Insets. 0 0 0 0)))
+                                    screen-bottom (if screen-bounds
+                                                    (- (.getMaxY screen-bounds) (or (some-> screen-insets .bottom) 0))
+                                                    Double/MAX_VALUE)
+                                    caret-bottom-screen (+ (.y pt) raw-y)]
+                                (> (+ caret-bottom-screen popup-height) screen-bottom))))
+                   ;; Float popup above caret / input field
+                   (- (if r (int (.getY r)) 0) popup-height 2)
+                   raw-y)
+         editor-width (.getWidth editor)
+         popup-x (if (and (pos? editor-width) (> (+ x 620) editor-width))
+                   (max 0 (- editor-width 630))
+                   x)
+         state {:popup popup
+                :list list
+                :model model
+                :doc-area doc-area
+                :start start
+                :word-end word-end
+                :status-fn status-fn
+                :highlight-fn highlight-now!
+                :dirty-fn update-dirty!
+                :editor editor
+                :extra-context extra-context
+                :just-committed-atom just-committed-atom}]
+     (reset! active-popup-atom state)
+     (.addPopupMenuListener popup
+       (reify PopupMenuListener
+         (popupMenuWillBecomeInvisible [this e]
+           (reset! active-popup-atom nil))
+         (popupMenuCanceled [this e]
+           (reset! active-popup-atom nil))
+         (popupMenuWillBecomeVisible [this e])))
+     (.addMouseListener list
+       (proxy [MouseAdapter] []
+         (mouseClicked [^MouseEvent e]
+           (when (= (.getClickCount e) 2)
+             (commit-autocomplete! active-popup-atom)))))
+     (try
+       (.show popup editor popup-x popup-y)
+       (catch Exception _ nil))
+     (.requestFocusInWindow editor))))
 
 (defn trigger-autocomplete!
   "Triggers autocomplete at the caret position in `editor`.
    - 0 matches: notifies status bar.
    - 1 match: immediately auto-completes and updates dirty state.
-   - >1 matches: shows popup list beneath caret."
+   - >1 matches: shows popup list beneath/above caret."
   ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty!]
+   (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! nil nil))
+  ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty! extra-context]
+   (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! extra-context nil))
+  ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom]
    (let [doc (.getDocument editor)
          text (.getText doc 0 (.getLength doc))
          caret (.getCaretPosition editor)
@@ -1028,7 +1076,7 @@
          prefix (:prefix prefix-info)
          start (:start prefix-info)
          word-end (:word-end prefix-info)
-         candidates (syntax/get-autocomplete-candidates prefix text caret)]
+         candidates (syntax/get-autocomplete-candidates prefix text caret extra-context)]
      (cond
        (empty? candidates)
        (do
@@ -1053,7 +1101,7 @@
 
        :else
        (do
-         (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty!)
+         (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom)
          :multi-match)))))
 
 (defn setup-autocomplete-keys!
@@ -1063,50 +1111,48 @@
     (proxy [KeyAdapter] []
       (keyPressed [^KeyEvent e]
         (when-let [st @active-popup-atom]
-          (when (.isVisible ^JPopupMenu (:popup st))
-            (let [code (.getKeyCode e)]
-              (cond
-                (or (= code KeyEvent/VK_ENTER) (= code KeyEvent/VK_TAB))
-                (do
-                  (.consume e)
-                  (commit-autocomplete! active-popup-atom))
+          (let [code (.getKeyCode e)]
+            (cond
+              (or (= code KeyEvent/VK_ENTER) (= code KeyEvent/VK_TAB))
+              (do
+                (.consume e)
+                (commit-autocomplete! active-popup-atom))
 
-                (= code KeyEvent/VK_ESCAPE)
-                (do
-                  (.consume e)
-                  (dismiss-autocomplete! active-popup-atom))
+              (= code KeyEvent/VK_ESCAPE)
+              (do
+                (.consume e)
+                (dismiss-autocomplete! active-popup-atom))
 
-                (= code KeyEvent/VK_UP)
-                (do
-                  (.consume e)
-                  (move-popup-selection! active-popup-atom -1))
+              (= code KeyEvent/VK_UP)
+              (do
+                (.consume e)
+                (move-popup-selection! active-popup-atom -1))
 
-                (= code KeyEvent/VK_DOWN)
-                (do
-                  (.consume e)
-                  (move-popup-selection! active-popup-atom 1))
+              (= code KeyEvent/VK_DOWN)
+              (do
+                (.consume e)
+                (move-popup-selection! active-popup-atom 1))
 
-                (= code KeyEvent/VK_PAGE_UP)
-                (do
-                  (.consume e)
-                  (move-popup-selection! active-popup-atom -6))
+              (= code KeyEvent/VK_PAGE_UP)
+              (do
+                (.consume e)
+                (move-popup-selection! active-popup-atom -6))
 
-                (= code KeyEvent/VK_PAGE_DOWN)
-                (do
-                  (.consume e)
-                  (move-popup-selection! active-popup-atom 6))
+              (= code KeyEvent/VK_PAGE_DOWN)
+              (do
+                (.consume e)
+                (move-popup-selection! active-popup-atom 6))
 
-                :else nil)))))
+              :else nil))))
 
       (keyReleased [^KeyEvent e]
         (when-let [st @active-popup-atom]
-          (when (.isVisible ^JPopupMenu (:popup st))
-            (let [code (.getKeyCode e)]
-              (when-not (contains? #{KeyEvent/VK_UP KeyEvent/VK_DOWN KeyEvent/VK_PAGE_UP KeyEvent/VK_PAGE_DOWN
-                                     KeyEvent/VK_ENTER KeyEvent/VK_TAB KeyEvent/VK_ESCAPE
-                                     KeyEvent/VK_SHIFT KeyEvent/VK_CONTROL KeyEvent/VK_ALT KeyEvent/VK_META}
-                                   code)
-                (update-autocomplete-filter! active-popup-atom)))))))))
+          (let [code (.getKeyCode e)]
+            (when-not (contains? #{KeyEvent/VK_UP KeyEvent/VK_DOWN KeyEvent/VK_PAGE_UP KeyEvent/VK_PAGE_DOWN
+                                   KeyEvent/VK_ENTER KeyEvent/VK_TAB KeyEvent/VK_ESCAPE
+                                   KeyEvent/VK_SHIFT KeyEvent/VK_CONTROL KeyEvent/VK_ALT KeyEvent/VK_META}
+                                 code)
+              (update-autocomplete-filter! active-popup-atom))))))))
 
 (defn setup-editor-context-menu!
   "Attaches a right-click context menu to the editor with navigation, refactoring, formatting, and edit actions."
@@ -1173,6 +1219,39 @@
                  (when (and (number? pos) (>= pos 0))
                    (.setCaretPosition editor (int pos)))))))))
      (.setComponentPopupMenu editor popup))))
+
+(defn setup-input-field-context-menu!
+  "Attaches a right-click context menu to the REPL input field with Autocomplete, Cut, Copy, Paste, and Clear."
+  [^JTextField input-field autocomplete-fn!]
+  (let [popup (JPopupMenu.)
+        item-autocomplete (JMenuItem. "Autocomplete (Ctrl+Space)")
+        item-cut (JMenuItem. "Cut")
+        item-copy (JMenuItem. "Copy")
+        item-paste (JMenuItem. "Paste")
+        item-clear (JMenuItem. "Clear")]
+    (.addActionListener item-autocomplete (proxy [ActionListener] [] (actionPerformed [e] (when autocomplete-fn! (autocomplete-fn!)))))
+    (.addActionListener item-cut (proxy [ActionListener] [] (actionPerformed [e] (.cut input-field))))
+    (.addActionListener item-copy (proxy [ActionListener] [] (actionPerformed [e] (.copy input-field))))
+    (.addActionListener item-paste (proxy [ActionListener] [] (actionPerformed [e] (.paste input-field))))
+    (.addActionListener item-clear (proxy [ActionListener] [] (actionPerformed [e] (.setText input-field ""))))
+    (.add popup item-autocomplete)
+    (.addSeparator popup)
+    (.add popup item-cut)
+    (.add popup item-copy)
+    (.add popup item-paste)
+    (.addSeparator popup)
+    (.add popup item-clear)
+    (.addMouseListener input-field
+      (proxy [MouseAdapter] []
+        (mousePressed [^MouseEvent e]
+          (when (SwingUtilities/isRightMouseButton e)
+            (let [pt (.getPoint e)
+                  pos (try (.viewToModel2D input-field pt)
+                           (catch Exception _
+                             (.viewToModel input-field pt)))]
+              (when (and (number? pos) (>= pos 0) (str/blank? (.getSelectedText input-field)))
+                (.setCaretPosition input-field (int pos))))))))
+    (.setComponentPopupMenu input-field popup)))
 
 (defn setup-undo! [^JTextComponent editor]
   (let [undo-mgr (javax.swing.undo.UndoManager.)
@@ -1384,7 +1463,8 @@
         _ (.setFileFilter fc (javax.swing.filechooser.FileNameExtensionFilter. "Clojure files (*.clj, *.cljc, *.edn)" (into-array ["clj" "cljc" "edn"])))
 
         undo-mgr (setup-undo! editor)
-        active-popup (atom nil)]
+        active-popup (atom nil)
+        input-autocomplete-committed (atom false)]
 
     ;; --- Setup Fonts ---
     (letfn [(apply-font! [sz]
@@ -1524,8 +1604,14 @@
                     (quick-doc-action! []
                       (show-quick-doc! frame editor))
 
+                    (repl-autocomplete-action! []
+                      (let [editor-text (fn [] (.getText (.getDocument editor) 0 (.getLength (.getDocument editor))))]
+                        (trigger-autocomplete! input-field set-status! active-popup nil nil editor-text input-autocomplete-committed)))
+
                     (autocomplete-action! []
-                      (trigger-autocomplete! editor set-status! active-popup highlight-now! update-dirty!))]
+                      (if (.hasFocus input-field)
+                        (repl-autocomplete-action!)
+                        (trigger-autocomplete! editor set-status! active-popup highlight-now! update-dirty!)))]
 
               (let [find-ctrl (create-find-replace-panel editor highlight-now! update-title! set-status!)
                     find-panel (:panel find-ctrl)
@@ -1536,43 +1622,62 @@
                     find-prev! (:find-prev! find-ctrl)]
                 (.add definitions-panel find-panel BorderLayout/SOUTH)
 
+                ;; Autocomplete for REPL input field
+                (.setFocusTraversalKeys input-field KeyboardFocusManager/FORWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
+                (setup-autocomplete-keys! input-field active-popup)
+                (setup-input-field-context-menu! input-field repl-autocomplete-action!)
+
+                (let [im (.getInputMap input-field JComponent/WHEN_FOCUSED)
+                      am (.getActionMap input-field)]
+                  (.put im (KeyStroke/getKeyStroke "control SPACE") "repl-autocomplete")
+                  (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SPACE KeyEvent/CTRL_DOWN_MASK) "repl-autocomplete")
+                  (.put im (KeyStroke/getKeyStroke "TAB") "repl-autocomplete")
+                  (.put am "repl-autocomplete"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e]
+                        (if @active-popup
+                          (commit-autocomplete! active-popup)
+                          (repl-autocomplete-action!))))))
+
                 ;; --- Input Field Action (REPL & Stdin) ---
                 (.addActionListener input-field
                   (proxy [ActionListener] []
                     (actionPerformed [e]
-                      (let [text (.getText input-field)]
-                        (.setText input-field "")
-                        (if (eval/waiting-for-input? eval-ctx)
-                          ;; Process GUI stdin input
-                          (do
-                            (append-output! (str text "\n"))
-                            (eval/push-stdin! eval-ctx text))
-                          ;; Process REPL expression
-                          (if (eval/evaluating? eval-ctx)
-                            (append-output! "; [Warning: Code is currently running. Click Stop to cancel.]\n")
-                            (when-not (str/blank? text)
-                              (swap! (:history eval-ctx) eval/history-add text)
-                              (append-output! (str "> " text "\n"))
-                              (run-code-string! text))))))))
+                      (when-not (or @input-autocomplete-committed @active-popup)
+                        (let [text (.getText input-field)]
+                          (.setText input-field "")
+                          (if (eval/waiting-for-input? eval-ctx)
+                            ;; Process GUI stdin input
+                            (do
+                              (append-output! (str text "\n"))
+                              (eval/push-stdin! eval-ctx text))
+                            ;; Process REPL expression
+                            (if (eval/evaluating? eval-ctx)
+                              (append-output! "; [Warning: Code is currently running. Click Stop to cancel.]\n")
+                              (when-not (str/blank? text)
+                                (swap! (:history eval-ctx) eval/history-add text)
+                                (append-output! (str "> " text "\n"))
+                                (run-code-string! text)))))))))
 
                 ;; History navigation on Up / Down arrow
                 (.addKeyListener input-field
                   (proxy [KeyAdapter] []
                     (keyPressed [e]
-                      (cond
-                        (= (.getKeyCode e) KeyEvent/VK_UP)
-                        (do
-                          (.consume e)
-                          (let [[new-hist display-text] (eval/history-prev @(:history eval-ctx) (.getText input-field))]
-                            (reset! (:history eval-ctx) new-hist)
-                            (.setText input-field display-text)))
+                      (when-not (or (.isConsumed e) @active-popup)
+                        (cond
+                          (= (.getKeyCode e) KeyEvent/VK_UP)
+                          (do
+                            (.consume e)
+                            (let [[new-hist display-text] (eval/history-prev @(:history eval-ctx) (.getText input-field))]
+                              (reset! (:history eval-ctx) new-hist)
+                              (.setText input-field display-text)))
 
-                        (= (.getKeyCode e) KeyEvent/VK_DOWN)
-                        (do
-                          (.consume e)
-                          (let [[new-hist display-text] (eval/history-next @(:history eval-ctx))]
-                            (reset! (:history eval-ctx) new-hist)
-                            (.setText input-field display-text)))))))
+                          (= (.getKeyCode e) KeyEvent/VK_DOWN)
+                          (do
+                            (.consume e)
+                            (let [[new-hist display-text] (eval/history-next @(:history eval-ctx))]
+                              (reset! (:history eval-ctx) new-hist)
+                              (.setText input-field display-text))))))))
 
                 ;; Wire toolbar buttons
                 (.addActionListener btn-run (proxy [ActionListener] [] (actionPerformed [e] (run-definitions!))))
