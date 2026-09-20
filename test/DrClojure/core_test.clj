@@ -786,33 +786,31 @@
     (let [frame (ui/create-ide nil)]
       (try
         (let [content-pane (.getContentPane frame)
-              all-tfs (atom [])
+              all-panes (atom [])
               collect (fn c [cmp]
-                        (when (instance? JTextField cmp)
-                          (swap! all-tfs conj cmp))
+                        (when (instance? JTextPane cmp)
+                          (swap! all-panes conj cmp))
                         (when (instance? java.awt.Container cmp)
                           (doseq [child (.getComponents cmp)]
                             (c child))))
               _ (collect content-pane)
-              input-field (first (filter (fn [tf]
-                                           (when-let [p (.getParent tf)]
-                                             (some #(and (instance? JLabel %) (= (.getText ^JLabel %) " > "))
-                                                   (.getComponents p))))
-                                         @all-tfs))]
-          (is (some? input-field))
-          ;; Check input map has repl-autocomplete for Ctrl+Space and Tab
-          (let [im (.getInputMap input-field JComponent/WHEN_FOCUSED)]
-            (is (= "repl-autocomplete" (.get im (KeyStroke/getKeyStroke "control SPACE"))))
-            (is (= "repl-autocomplete" (.get im (KeyStroke/getKeyStroke "TAB")))))
-          ;; Check context menu exists and has Autocomplete item
-          (let [menu (.getComponentPopupMenu input-field)]
+              interactions-pane (first (filter (fn [p]
+                                                 (= "interactions-console" (.getName ^JTextPane p)))
+                                               @all-panes))]
+          (is (some? interactions-pane))
+          ;; Check input map has console-autocomplete for Ctrl+Space and Tab
+          (let [im (.getInputMap interactions-pane JComponent/WHEN_FOCUSED)]
+            (is (= "console-autocomplete" (.get im (KeyStroke/getKeyStroke "control SPACE"))))
+            (is (= "console-autocomplete" (.get im (KeyStroke/getKeyStroke "TAB")))))
+          ;; Check context menu exists and has Autocomplete and Clear items
+          (let [menu (.getComponentPopupMenu interactions-pane)]
             (is (some? menu))
             (let [menu-items (into {} (keep (fn [i] (when-let [it (.getComponent menu i)]
                                                       (when (instance? JMenuItem it)
                                                         [(.getText ^JMenuItem it) it])))
                                             (range (.getComponentCount menu))))]
               (is (contains? menu-items "Autocomplete (Ctrl+Space)"))
-              (is (contains? menu-items "Clear")))))
+              (is (contains? menu-items "Clear Console (Ctrl+L)")))))
         (finally
           (.dispose frame)
           (swap! ui/active-windows dissoc frame))))))
@@ -961,96 +959,109 @@
       (try
         (let [pane (.getContentPane frame)
               components (tree-seq #(instance? java.awt.Container %) #(.getComponents %) pane)
-              editor (first (filter #(instance? JTextPane %) components))
-              input-field (first (filter #(and (instance? JTextField %) (= "repl-input" (.getName %))) components))
-              output-area (first (filter #(instance? JTextArea %) components))]
+              interactions-pane (first (filter #(and (instance? JTextPane %)
+                                                     (= "interactions-console" (.getName ^JTextPane %)))
+                                               components))
+              editor (first (filter #(and (instance? JTextPane %)
+                                          (not= "interactions-console" (.getName ^JTextPane %)))
+                                    components))]
           (is (some? editor))
-          (is (some? input-field))
-          (is (some? output-area))
+          (is (some? interactions-pane))
           (let [f-editor (.getFont editor)
-                f-input (.getFont input-field)
-                f-output (.getFont output-area)]
+                f-console (.getFont interactions-pane)]
             ;; Verify font families are Monospaced
             (is (= Font/MONOSPACED (.getFamily f-editor)))
-            (is (= Font/MONOSPACED (.getFamily f-input)))
-            (is (= Font/MONOSPACED (.getFamily f-output)))
-            ;; Verify all fonts can display Korean characters without missing-glyph tofu
+            (is (= Font/MONOSPACED (.getFamily f-console)))
+            ;; Verify fonts can display Korean characters without missing-glyph tofu
             (is (.canDisplay f-editor (first "한")))
-            (is (.canDisplay f-input (first "한")))
-            (is (.canDisplay f-output (first "한")))
+            (is (.canDisplay f-console (first "한")))
             (is (= -1 (.canDisplayUpTo f-editor "한글 Clojure 코드 테스트")))
-            (is (= -1 (.canDisplayUpTo f-input "한글 REPL 입력 테스트")))
-            (is (= -1 (.canDisplayUpTo f-output "한글 출력 테스트")))))
+            (is (= -1 (.canDisplayUpTo f-console "한글 콘솔 테스트")))))
         (finally
           (.dispose frame)))))
 
-  (testing "Korean letters (한글) in definitions editor and REPL input field"
+  (testing "Korean letters (한글) in definitions editor and interactions console"
     (let [frame (ui/create-ide nil)]
       (try
         (let [pane (.getContentPane frame)
               components (tree-seq #(instance? java.awt.Container %) #(.getComponents %) pane)
-              editor (first (filter #(instance? JTextPane %) components))
-              input-field (first (filter #(and (instance? JTextField %) (= "repl-input" (.getName %))) components))
-              korean-code "(defn 넓이-계산 [가로 세로]\n  \"사각형의 넓이를 계산합니다.\"\n  (* 가로 세로))\n\n(넓이-계산 10 20)"
-              korean-repl "(println \"안녕하세요 세계!\")"]
-          ;; Definitions editor
+              editor (first (filter #(and (instance? JTextPane %)
+                                          (not= "interactions-console" (.getName ^JTextPane %)))
+                                    components))
+              korean-code "(defn 넓이-계산 [가로 세로]\n  \"사각형의 넓이를 계산합니다.\"\n  (* 가로 세로))\n\n(넓이-계산 10 20)"]
+          ;; Definitions editor supports Korean code
           (.setText editor korean-code)
           (is (= korean-code (.getText editor)))
           (is (.contains (.getText editor) "넓이-계산"))
-          (is (.contains (.getText editor) "사각형의 넓이를 계산합니다."))
-
-          ;; REPL input field
-          (.setText input-field korean-repl)
-          (is (= korean-repl (.getText input-field)))
-          (is (.contains (.getText input-field) "안녕하세요 세계!")))
+          (is (.contains (.getText editor) "사각형의 넓이를 계산합니다.")))
         (finally
           (.dispose frame))))))
 
 (deftest stdin-ctrl-d-eof-test
-  (testing "Pressing Ctrl+D in stdin textfield sends EOF and unblocks evaluation"
+  (testing "Pressing Ctrl+D in interactions console sends EOF and unblocks evaluation"
     (let [frame (ui/create-ide nil)]
       (try
-        (let [pane (.getContentPane frame)
-              components (tree-seq #(instance? java.awt.Container %) #(.getComponents %) pane)
-              input-field (first (filter #(and (instance? JTextField %) (= "repl-input" (.getName %))) components))
-              output-area (first (filter #(and (instance? JTextArea %) (= "output-area" (.getName %))) components))]
-          (is (some? input-field))
-          (is (some? output-area))
+        (let [content-pane (.getContentPane frame)
+              components (tree-seq #(instance? java.awt.Container %) #(.getComponents %) content-pane)
+              console (first (filter #(and (instance? JTextPane %)
+                                           (= "interactions-console" (.getName ^JTextPane %)))
+                                     components))]
+          (is (some? console))
 
-          ;; Test 1: Empty textfield + Ctrl+D via ActionMap
-          (.setText input-field "(let [s (read-line)] (str \"got: \" (pr-str s)))")
-          (doseq [al (.getActionListeners input-field)]
-            (.actionPerformed al (ActionEvent. input-field ActionEvent/ACTION_PERFORMED "enter")))
-          (Thread/sleep 300)
+          ;; Test 1: Submit code that calls read-line, then send EOF via ActionMap
+          (let [code "(let [s (read-line)] (str \"got: \" (pr-str s)))"]
+            ;; Type the code into the console (append after prompt) and submit via Enter keylistener
+            (SwingUtilities/invokeAndWait
+              (fn []
+                (let [doc (.getDocument console)
+                      len (.getLength doc)]
+                  (.insertString doc len code nil))))
+            (let [enter-event (KeyEvent. console KeyEvent/KEY_PRESSED (System/currentTimeMillis)
+                                         0 KeyEvent/VK_ENTER \newline)]
+              (doseq [kl (.getKeyListeners console)]
+                (.keyPressed kl enter-event)))
+            (Thread/sleep 300))
 
-          (let [am (.getActionMap input-field)
+          ;; Fire stdin-eof via ActionMap on the console
+          (let [am (.getActionMap console)
                 act (.get am "stdin-eof")]
             (is (some? act))
-            (.actionPerformed act (ActionEvent. input-field ActionEvent/ACTION_PERFORMED "stdin-eof")))
+            (.actionPerformed act (ActionEvent. console ActionEvent/ACTION_PERFORMED "stdin-eof")))
           (Thread/sleep 400)
-          (is (.contains (.getText output-area) "got: nil"))
+          (is (.contains (.getText console) "got: nil"))
 
-          ;; Test 2: Text in field + Ctrl+D via KeyEvent
-          (.setText input-field "(let [l1 (read-line) l2 (read-line)] (str l1 \":\" (pr-str l2)))")
-          (doseq [al (.getActionListeners input-field)]
-            (.actionPerformed al (ActionEvent. input-field ActionEvent/ACTION_PERFORMED "enter")))
-          (Thread/sleep 300)
-          (.setText input-field "user-input-line")
-          (let [ctrl-d (KeyEvent. input-field KeyEvent/KEY_PRESSED (System/currentTimeMillis)
+          ;; Test 2: Submit code with two read-lines, provide one line then Ctrl+D EOF
+          (let [code "(let [l1 (read-line) l2 (read-line)] (str l1 \":\" (pr-str l2)))"]
+            (SwingUtilities/invokeAndWait
+              (fn []
+                (let [doc (.getDocument console)
+                      len (.getLength doc)]
+                  (.insertString doc len code nil))))
+            (let [enter-event (KeyEvent. console KeyEvent/KEY_PRESSED (System/currentTimeMillis)
+                                         0 KeyEvent/VK_ENTER \newline)]
+              (doseq [kl (.getKeyListeners console)]
+                (.keyPressed kl enter-event)))
+            (Thread/sleep 300))
+          ;; Type a line of input then Ctrl+D (EOF)
+          (SwingUtilities/invokeAndWait
+            (fn []
+              (let [doc (.getDocument console)
+                    len (.getLength doc)]
+                (.insertString doc len "user-input-line" nil))))
+          (let [ctrl-d (KeyEvent. console KeyEvent/KEY_PRESSED (System/currentTimeMillis)
                                   KeyEvent/CTRL_DOWN_MASK KeyEvent/VK_D (char 4))]
-            (doseq [kl (.getKeyListeners input-field)]
+            (doseq [kl (.getKeyListeners console)]
               (.keyPressed kl ctrl-d))
             (is (.isConsumed ctrl-d)))
           (Thread/sleep 400)
-          (is (.contains (.getText output-area) "user-input-line:nil"))
+          (is (.contains (.getText console) "user-input-line:nil"))
 
-          ;; Test 3: Ctrl+D when not waiting for input does not send EOF or disrupt REPL
-          (.setText input-field "(+ 10 20)")
-          (let [ctrl-d (KeyEvent. input-field KeyEvent/KEY_PRESSED (System/currentTimeMillis)
+          ;; Test 3: Ctrl+D when not waiting for input does not consume the event
+          (let [ctrl-d (KeyEvent. console KeyEvent/KEY_PRESSED (System/currentTimeMillis)
                                   KeyEvent/CTRL_DOWN_MASK KeyEvent/VK_D (char 4))]
-            (doseq [kl (.getKeyListeners input-field)]
-              (.keyPressed kl ctrl-d)))
-          ;; input-field text should not be cleared since it's not waiting for stdin
-          (is (= "(+ 10 20)" (.getText input-field))))
+            (doseq [kl (.getKeyListeners console)]
+              (.keyPressed kl ctrl-d))
+            ;; When not waiting for stdin, the event should NOT be consumed
+            (is (not (.isConsumed ctrl-d)))))
         (finally
           (.dispose frame))))))
