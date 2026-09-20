@@ -8,7 +8,7 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
   - **Definitions Pane (Top)**: Code editor for writing Clojure definitions and programs.
   - **Interactions Pane (Bottom)**: Interactive REPL console showing output, return values, and real-time execution.
 - **Real-Time Output Streaming**: `println`, `prn`, and standard output/error stream live into the GUI console.
-- **GUI Standard Input (`stdin`)**: Interactive console input (`read-line`) is processed directly within the GUI prompt with automatic focus and status indication.
+- **GUI Standard Input (`stdin`)**: Interactive console input (`read-line`) is processed directly within the interactions pane with status indication.
 - **Asynchronous Execution & Stop Button**: Long-running loops or calculations run off the UI thread and can be safely interrupted at any time via the **Stop** button or `Escape`.
 - **REPL Command History**: Navigate previous REPL commands in the prompt using `Up` and `Down` arrow keys.
 - **In-Editor Find & Replace**: Press `Ctrl+F` (or `Ctrl+H` / `Ctrl+R` for Replace) to toggle the docked search bar. Features live match count ("X of Y"), case-sensitivity toggle, `F3` / `Shift+F3` navigation, and single or Replace-All replacements.
