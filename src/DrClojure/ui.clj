@@ -2,8 +2,8 @@
   "DrClojure Swing User Interface.
    Implements a DrRacket-inspired dual-pane layout with:
    - Definitions editor (top) with line numbers, bracket matching, undo/redo, 2-space tabs.
-   - Interactions console (bottom) with live stdout, GUI stdin, REPL history, and Stop button.
-   - Clojure cheatsheet, toolbar, status bar, and unsaved changes confirmation."
+   - Unified Interactions console (bottom) integrating output display and REPL/stdin prompt.
+   - Clojure cheatsheet, toolbar, status bar, and multi-window support."
   (:require [clojure.string :as str]
             [DrClojure.eval :as eval]
             [DrClojure.syntax :as syntax])
@@ -14,7 +14,8 @@
                         JList DefaultListModel DefaultListCellRenderer ListSelectionModel ScrollPaneConstants)
            (javax.swing.event DocumentListener CaretListener UndoableEditListener DocumentEvent$EventType ListSelectionListener PopupMenuListener)
            (javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent
-                             DefaultStyledDocument AbstractDocument$DefaultDocumentEvent)
+                             DefaultStyledDocument AbstractDocument$DefaultDocumentEvent
+                             SimpleAttributeSet StyleConstants)
            (java.awt BorderLayout FlowLayout GridLayout Dimension Font Color Insets
                      KeyboardFocusManager Toolkit Desktop Desktop$Action GraphicsEnvironment)
            (java.net URI)
@@ -51,18 +52,13 @@
 ;; --- Bracket Matching ---
 
 (defn find-matching-bracket
-  "Finds the matching bracket position for the bracket at `pos` in `text`.
-   Uses lexical tokenization so brackets inside comments, strings, regexes,
-   and character literals are completely ignored. Returns nil if unmatched."
+  "Finds the matching bracket position for the bracket at `pos` in `text`."
   [^String text pos]
   (when (and (string? text) (<= 0 pos (dec (.length text))))
     (get (:matches (syntax/compute-brackets text)) (long pos))))
 
 (defn setup-bracket-matching!
-  "Highlights matching parentheses/brackets at the caret position.
-   Uses syntax tokenization so brackets inside strings/comments are ignored.
-   Matched pairs are highlighted with warm amber, and unmatched brackets
-   are highlighted with soft red."
+  "Highlights matching parentheses/brackets at the caret position."
   ([^JTextComponent editor]
    (setup-bracket-matching! editor nil))
   ([^JTextComponent editor bracket-info-atom]
@@ -179,10 +175,8 @@
           (.setSelectionStart editor new-start)
           (.setSelectionEnd editor new-end))))))
 
-;; --- Toggle Comment ---
-
 (defn toggle-comment!
-  "Comments or uncomments the current line or selected lines by toggling '; ' at the start of lines."
+  "Comments or uncomments the current line or selected lines."
   [^JTextComponent editor]
   (let [doc (.getDocument editor)
         root (.getDefaultRootElement doc)
@@ -210,7 +204,6 @@
                                         (boolean (re-find #"^[ ]*;+" t))))
                                     non-empty-lines))]
     (if all-commented?
-      ;; Uncomment: remove '; ' or ';'
       (doseq [line-idx (reverse lines)]
         (let [elem (.getElement root line-idx)
               s (.getStartOffset elem)
@@ -220,7 +213,6 @@
             (let [leading-spaces (count (nth m 1))
                   comment-chars (count (nth m 2))]
               (.remove doc (+ s leading-spaces) comment-chars)))))
-      ;; Comment: add '; ' at the start of each line
       (doseq [line-idx (reverse lines)]
         (let [elem (.getElement root line-idx)
               s (.getStartOffset elem)
@@ -229,10 +221,7 @@
           (when-not (str/blank? t)
             (.insertString doc s "; " nil)))))))
 
-;; --- Clojure Code Formatting ---
-
 (defn format-all!
-  "Re-indents and formats the entire document in `editor` according to Clojure syntax rules."
   ([^JTextComponent editor] (format-all! editor nil))
   ([^JTextComponent editor status-fn]
    (let [old-text (.getText editor)
@@ -246,14 +235,12 @@
          (when status-fn (status-fn " Formatted entire document ")))))))
 
 (defn format-selection!
-  "Re-indents and formats the active selection or current line in `editor`."
   ([^JTextComponent editor] (format-selection! editor nil))
   ([^JTextComponent editor status-fn]
    (let [old-text (.getText editor)
          sel-start (.getSelectionStart editor)
          sel-end (.getSelectionEnd editor)]
      (if (not= sel-start sel-end)
-       ;; Format selected lines
        (let [new-text (syntax/format-selection-text old-text sel-start sel-end)]
          (if (= old-text new-text)
            (when status-fn (status-fn " Selection already formatted "))
@@ -262,7 +249,6 @@
              (.setText editor new-text)
              (.setCaretPosition editor (min max-len caret))
              (when status-fn (status-fn " Formatted selection ")))))
-       ;; No selection: format current line
        (let [pos (.getCaretPosition editor)
              doc-len (.length old-text)
              line-start (let [idx (.lastIndexOf old-text "\n" (max 0 (dec pos)))]
@@ -277,8 +263,6 @@
              (.setCaretPosition editor (min max-len pos))
              (when status-fn (status-fn " Formatted current line ")))))))))
 
-;; --- Smart Auto-Indent on Enter ---
-
 (def open->matching-close
   {\( \), \[ \], \{ \}, \" \"})
 
@@ -286,9 +270,6 @@
   #{\) \] \} \"})
 
 (defn handle-smart-enter!
-  "Inserts a newline and auto-computes the appropriate indentation spaces based on open Clojure forms.
-   If cursor is between matched bracket delimiters (e.g. `(|)`, `[|]`, `{|}`), creates an indented line
-   for the cursor and pushes the closing delimiter onto a dedented line."
   [^JTextComponent editor]
   (let [doc (.getDocument editor)
         sel-start (.getSelectionStart editor)
@@ -319,8 +300,6 @@
           (.setCaretPosition editor (+ pos (count insert-str))))))))
 
 (defn setup-auto-brackets!
-  "Attaches key listener to editor for auto-closing brackets, delimiter wrapping of selections,
-   step-over closing delimiters, and paired backspace deletion."
   [^JTextComponent editor]
   (.addKeyListener editor
     (proxy [KeyAdapter] []
@@ -328,14 +307,12 @@
         (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
           (let [ch (.getKeyChar e)]
             (cond
-              ;; 1. Open delimiter: wrap selection or insert pair
               (contains? open->matching-close ch)
               (let [doc (.getDocument editor)
                     sel-start (.getSelectionStart editor)
                     sel-end (.getSelectionEnd editor)
                     close-ch (open->matching-close ch)]
                 (if (> sel-end sel-start)
-                  ;; Wrap selection
                   (let [sel-text (.getSelectedText editor)
                         wrapped (str ch sel-text close-ch)]
                     (.consume e)
@@ -343,22 +320,18 @@
                     (.insertString doc sel-start wrapped nil)
                     (.setSelectionStart editor sel-start)
                     (.setSelectionEnd editor (+ sel-start (count wrapped))))
-                  ;; No selection
                   (let [caret (.getCaretPosition editor)
                         doc-len (.getLength doc)
                         next-ch (when (< caret doc-len) (.charAt (.getText doc caret 1) 0))]
                     (if (and (= ch \") (= next-ch \"))
-                      ;; Step over existing quote
                       (do
                         (.consume e)
                         (.setCaretPosition editor (inc caret)))
-                      ;; Insert pair
                       (do
                         (.consume e)
                         (.insertString doc caret (str ch close-ch) nil)
                         (.setCaretPosition editor (inc caret)))))))
 
-              ;; 2. Close delimiter: step-over if next character matches
               (contains? close-delimiters ch)
               (let [sel-start (.getSelectionStart editor)
                     sel-end (.getSelectionEnd editor)]
@@ -376,7 +349,6 @@
 
       (keyPressed [^KeyEvent e]
         (when-not (or (.isControlDown e) (.isAltDown e) (.isMetaDown e))
-          ;; 3. Paired Backspace deletion
           (when (= (.getKeyCode e) KeyEvent/VK_BACK_SPACE)
             (let [sel-start (.getSelectionStart editor)
                   sel-end (.getSelectionEnd editor)]
@@ -398,7 +370,6 @@
   (.setFocusTraversalKeys editor KeyboardFocusManager/BACKWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
   (let [im (.getInputMap editor)
         am (.getActionMap editor)]
-    ;; Tab / Shift+Tab
     (.put im (KeyStroke/getKeyStroke "TAB") "block-indent")
     (.put am "block-indent"
       (proxy [AbstractAction] []
@@ -411,14 +382,12 @@
         (actionPerformed [e]
           (unindent-selection! editor))))
 
-    ;; Smart Enter
     (.put im (KeyStroke/getKeyStroke "ENTER") "smart-enter")
     (.put am "smart-enter"
       (proxy [AbstractAction] []
         (actionPerformed [e]
           (handle-smart-enter! editor))))
 
-    ;; Toggle Comment (Ctrl+/ and Ctrl+;)
     (.put im (KeyStroke/getKeyStroke "control SLASH") "toggle-comment")
     (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SLASH KeyEvent/CTRL_DOWN_MASK) "toggle-comment")
     (.put im (KeyStroke/getKeyStroke "control SEMICOLON") "toggle-comment")
@@ -429,9 +398,6 @@
           (toggle-comment-fn!))))))
 
 (defn jump-to-definition!
-  "Jumps to definition of the symbol under cursor/selection in the source editor without modifying status bar.
-   If defined in current buffer, moves caret, selects symbol, and scrolls into view.
-   If external Var, displays definition info dialog with namespace, file, and arglists."
   [^JFrame frame ^JTextComponent editor & [_set-status!]]
   (let [doc (.getDocument editor)
         text (.getText doc 0 (.getLength doc))
@@ -447,7 +413,6 @@
         (if def-target
           (let [start-pos (:start def-target)
                 line-num (:line def-target)]
-            ;; Position caret at start of symbol without selecting (prevents accidental deletion on typing)
             (.setCaretPosition editor (int start-pos))
             (.setSelectionStart editor (int start-pos))
             (.setSelectionEnd editor (int start-pos))
@@ -456,12 +421,10 @@
                 (.scrollRectToVisible editor (.getBounds rect))
                 (let [root (.. editor getDocument getDefaultRootElement)
                       line-idx (dec line-num)
-                      elem (.getElement root line-idx)
-                      line-start (.getStartOffset elem)]
+                      elem (.getElement root line-idx)]
                   (.scrollRectToVisible editor (java.awt.Rectangle. 0 (int (* line-idx 18)) 1 1))))
               (catch Exception _ nil))
             (.requestFocusInWindow editor))
-          ;; Search runtime Var if not found in current buffer
           (let [sym (symbol sym-name)
                 v (try (resolve sym) (catch Exception _ nil))]
             (if v
@@ -484,8 +447,6 @@
                 JOptionPane/INFORMATION_MESSAGE))))))))
 
 (defn rename-symbol-dialog!
-  "Prompts user for a new symbol name and renames all occurrences of the symbol
-   under cursor in the editor. Updates syntax highlighting and document dirty state."
   [^JFrame frame ^JTextComponent editor highlight-now! update-title! set-status!]
   (let [doc (.getDocument editor)
         text (.getText doc 0 (.getLength doc))
@@ -526,7 +487,6 @@
                 (if (empty? occs)
                   (set-status! (str "No occurrences of '" old-sym "' found to rename."))
                   (do
-                    ;; Replace occurrences in reverse order so lower offsets stay valid
                     (doseq [[s e] (reverse occs)]
                       (.remove doc (int s) (int (- e s)))
                       (.insertString doc (int s) new-sym nil))
@@ -540,7 +500,6 @@
 ;; --- Quick Documentation ---
 
 (defn show-doc-dialog!
-  "Displays documentation in a clean monospace dialog."
   [^JFrame frame ^String content ^String title]
   (let [dialog (JDialog. frame title false)
         text-area (JTextArea. 16 56)
@@ -575,7 +534,6 @@
     (.setVisible dialog true)))
 
 (defn show-quick-doc!
-  "Shows quick documentation and arglists for the symbol under the cursor without modifying the status bar."
   [^JFrame frame ^JTextComponent editor & [_set-status!]]
   (let [doc (.getDocument editor)
         text (.getText doc 0 (.getLength doc))
@@ -620,7 +578,6 @@
 ;; --- In-Editor Find & Replace Panel ---
 
 (defn create-find-replace-panel
-  "Creates an inline, dockable Find & Replace panel for the editor."
   [^JTextComponent editor highlight-now! update-title! set-status!]
   (let [panel (JPanel. (BorderLayout. 4 2))
         _ (.setBorder panel (BorderFactory/createCompoundBorder
@@ -756,7 +713,6 @@
                         (.requestFocusInWindow replace-field)
                         (.selectAll replace-field))]
 
-    ;; Action listeners
     (.addActionListener btn-next (proxy [ActionListener] [] (actionPerformed [e] (find-next!))))
     (.addActionListener btn-prev (proxy [ActionListener] [] (actionPerformed [e] (find-prev!))))
     (.addActionListener btn-replace (proxy [ActionListener] [] (actionPerformed [e] (replace-current!))))
@@ -764,20 +720,17 @@
     (.addActionListener btn-close (proxy [ActionListener] [] (actionPerformed [e] (close-panel!))))
     (.addActionListener match-case-cb (proxy [ActionListener] [] (actionPerformed [e] (update-matches!))))
 
-    ;; Enter / Shift+Enter in find-field
     (.addActionListener find-field
       (proxy [ActionListener] []
         (actionPerformed [e]
           (find-next!))))
 
-    ;; Real-time search update on typing
     (.. find-field getDocument (addDocumentListener
       (proxy [DocumentListener] []
         (insertUpdate [e] (update-matches!))
         (removeUpdate [e] (update-matches!))
         (changedUpdate [e] (update-matches!)))))
 
-    ;; Escape in find & replace fields closes panel
     (doseq [field [find-field replace-field]]
       (let [im (.getInputMap field JComponent/WHEN_FOCUSED)
             am (.getActionMap field)]
@@ -786,7 +739,6 @@
         (.put im (KeyStroke/getKeyStroke "shift ENTER") "prev-match")
         (.put am "prev-match" (proxy [AbstractAction] [] (actionPerformed [e] (find-prev!))))))
 
-    ;; Assemble Rows
     (let [row1 (JPanel. (FlowLayout. FlowLayout/LEFT 4 1))
           _ (.setBackground row1 (Color. 248 248 248))
           lbl-find (JLabel. "Find:")
@@ -838,8 +790,6 @@
 (defonce autocomplete-request-seq (AtomicLong. 0))
 (defonce doc-preview-seq (AtomicLong. 0))
 
-;; --- Autocomplete Popup & Controller ---
-
 (defn- create-autocomplete-renderer []
   (let [font-mono (Font. Font/MONOSPACED Font/PLAIN 12)
         bg-selected (Color. 220 235 252)
@@ -875,14 +825,12 @@
           c)))))
 
 (defn dismiss-autocomplete!
-  "Closes the active autocomplete popup if visible and clears state."
   [active-popup-atom]
   (when-let [{:keys [popup]} @active-popup-atom]
     (try (.setVisible ^JPopupMenu popup false) (catch Exception _ nil))
     (reset! active-popup-atom nil)))
 
 (defn commit-autocomplete!
-  "Inserts the currently selected candidate from the active autocomplete popup into the editor."
   [active-popup-atom]
   (when-let [{:keys [popup list start editor status-fn highlight-fn dirty-fn just-committed-atom]} @active-popup-atom]
     (try (.setVisible ^JPopupMenu popup false) (catch Exception _ nil))
@@ -921,7 +869,6 @@
              (.setText doc-area formatted)
              (.setCaretPosition doc-area 0))
            (if-not (SwingUtilities/isEventDispatchThread)
-             ;; If off EDT (e.g. tests without event loop), compute synchronously
              (let [extra-text (if (fn? extra-context) (extra-context) extra-context)
                    doc-info-primary (syntax/get-cached-symbol-doc sym text caret)
                    doc-info (if (and (= (:status doc-info-primary) :not-found) (seq extra-text))
@@ -931,7 +878,6 @@
                    formatted (syntax/format-autocomplete-doc doc-info candidate)]
                (.setText doc-area formatted)
                (.setCaretPosition doc-area 0))
-             ;; On EDT: fetch in background worker so EDT never blocks
              (let [doc-id (.incrementAndGet doc-preview-seq)
                    extra-text (if (fn? extra-context) (extra-context) extra-context)]
                (.setText doc-area (str sym "\n\nLoading documentation..."))
@@ -954,7 +900,6 @@
        (.setText doc-area "")))))
 
 (defn move-popup-selection!
-  "Moves selection index in active autocomplete popup list by `delta`."
   [active-popup-atom delta]
   (when-let [{:keys [list model doc-area editor extra-context]} @active-popup-atom]
     (let [cnt (.getSize ^DefaultListModel model)
@@ -973,8 +918,6 @@
             (update-doc-preview! doc-area sel txt c extra-context)))))))
 
 (defn update-autocomplete-filter!
-  "Dynamically updates candidates in the open popup as user continues typing or deletes.
-   Runs candidate calculation in background thread to avoid blocking user code input."
   ([active-popup-atom]
    (update-autocomplete-filter! active-popup-atom nil))
   ([active-popup-atom opts]
@@ -1003,7 +946,6 @@
                          (.ensureIndexIsVisible ^JList list 0)
                          (when doc-area
                            (update-doc-preview! doc-area (first candidates) text caret extra-context)))))
-                   ;; Background worker execution: does not block EDT keystrokes
                    (let [req-id (.incrementAndGet autocomplete-request-seq)]
                      (try
                        (.submit ^ExecutorService autocomplete-executor
@@ -1027,8 +969,6 @@
                        (catch Exception _ nil)))))))))))))
 
 (defn show-autocomplete-popup!
-  "Builds and displays a scrollable completion popup beneath or above the caret in `editor`.
-   Shows candidate list on the left and documentation preview on the right."
   ([^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty!]
    (show-autocomplete-popup! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! nil nil))
   ([^JTextComponent editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context]
@@ -1099,7 +1039,6 @@
                                                     Double/MAX_VALUE)
                                     caret-bottom-screen (+ (.y pt) raw-y)]
                                 (> (+ caret-bottom-screen popup-height) screen-bottom))))
-                   ;; Float popup above caret / input field
                    (- (if r (int (.getY r)) 0) popup-height 2)
                    raw-y)
          editor-width (.getWidth editor)
@@ -1170,11 +1109,6 @@
       :multi-match)))
 
 (defn trigger-autocomplete!
-  "Triggers autocomplete at the caret position in `editor`.
-   - 0 matches: notifies status bar.
-   - 1 match: immediately auto-completes and updates dirty state.
-   - >1 matches: shows popup list beneath/above caret.
-   Runs candidate calculation in a background thread on the EDT to prevent blocking user code input."
   ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty!]
    (trigger-autocomplete! editor status-fn active-popup-atom highlight-now! update-dirty! nil nil nil))
   ([^JTextComponent editor status-fn active-popup-atom highlight-now! update-dirty! extra-context]
@@ -1195,7 +1129,6 @@
      (if-not async?
        (let [candidates (syntax/get-autocomplete-candidates prefix text caret extra-context)]
          (apply-autocomplete-results! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom))
-       ;; Asynchronous execution on background worker: never blocks the EDT
        (let [req-id (.incrementAndGet autocomplete-request-seq)]
          (.submit ^ExecutorService autocomplete-executor
            ^Runnable (fn []
@@ -1208,7 +1141,6 @@
                                      cur-caret (.getCaretPosition editor)]
                                  (if (and (= cur-txt text) (= cur-caret caret))
                                    (apply-autocomplete-results! editor candidates start word-end status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom)
-                                   ;; User typed more characters while background query was resolving
                                    (let [cur-prefix-info (syntax/get-symbol-prefix-at-pos cur-txt cur-caret)
                                          cur-prefix (:prefix cur-prefix-info)
                                          cur-start (:start cur-prefix-info)]
@@ -1220,7 +1152,6 @@
                                            (show-autocomplete-popup! editor filtered start (:word-end cur-prefix-info) status-fn active-popup-atom highlight-now! update-dirty! extra-context just-committed-atom))))))))))))))))))
 
 (defn setup-autocomplete-keys!
-  "Installs key and focus listeners on `editor` to control autocomplete popup navigation and commits."
   [^JTextComponent editor active-popup-atom]
   (.addKeyListener editor
     (proxy [KeyAdapter] []
@@ -1270,7 +1201,6 @@
               (update-autocomplete-filter! active-popup-atom))))))))
 
 (defn setup-editor-context-menu!
-  "Attaches a right-click context menu to the editor with navigation, refactoring, formatting, and edit actions."
   ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! find-fn! replace-fn!]
    (setup-editor-context-menu! editor jump-fn! rename-fn! doc-fn! comment-fn! nil nil nil find-fn! replace-fn!))
   ([^JTextComponent editor jump-fn! rename-fn! doc-fn! comment-fn! format-all-fn! format-sel-fn! find-fn! replace-fn!]
@@ -1335,38 +1265,25 @@
                    (.setCaretPosition editor (int pos)))))))))
      (.setComponentPopupMenu editor popup))))
 
-(defn setup-input-field-context-menu!
-  "Attaches a right-click context menu to the REPL input field with Autocomplete, Cut, Copy, Paste, and Clear."
-  [^JTextField input-field autocomplete-fn!]
+(defn setup-interactions-context-menu!
+  "Right-click context menu for the integrated interactions console."
+  [^JTextPane console autocomplete-fn! clear-fn!]
   (let [popup (JPopupMenu.)
         item-autocomplete (JMenuItem. "Autocomplete (Ctrl+Space)")
-        item-cut (JMenuItem. "Cut")
         item-copy (JMenuItem. "Copy")
         item-paste (JMenuItem. "Paste")
-        item-clear (JMenuItem. "Clear")]
+        item-clear (JMenuItem. "Clear Console (Ctrl+L)")]
     (.addActionListener item-autocomplete (proxy [ActionListener] [] (actionPerformed [e] (when autocomplete-fn! (autocomplete-fn!)))))
-    (.addActionListener item-cut (proxy [ActionListener] [] (actionPerformed [e] (.cut input-field))))
-    (.addActionListener item-copy (proxy [ActionListener] [] (actionPerformed [e] (.copy input-field))))
-    (.addActionListener item-paste (proxy [ActionListener] [] (actionPerformed [e] (.paste input-field))))
-    (.addActionListener item-clear (proxy [ActionListener] [] (actionPerformed [e] (.setText input-field ""))))
+    (.addActionListener item-copy (proxy [ActionListener] [] (actionPerformed [e] (.copy console))))
+    (.addActionListener item-paste (proxy [ActionListener] [] (actionPerformed [e] (.paste console))))
+    (.addActionListener item-clear (proxy [ActionListener] [] (actionPerformed [e] (when clear-fn! (clear-fn!)))))
     (.add popup item-autocomplete)
     (.addSeparator popup)
-    (.add popup item-cut)
     (.add popup item-copy)
     (.add popup item-paste)
     (.addSeparator popup)
     (.add popup item-clear)
-    (.addMouseListener input-field
-      (proxy [MouseAdapter] []
-        (mousePressed [^MouseEvent e]
-          (when (SwingUtilities/isRightMouseButton e)
-            (let [pt (.getPoint e)
-                  pos (try (.viewToModel2D input-field pt)
-                           (catch Exception _
-                             (.viewToModel input-field pt)))]
-              (when (and (number? pos) (>= pos 0) (str/blank? (.getSelectedText input-field)))
-                (.setCaretPosition input-field (int pos))))))))
-    (.setComponentPopupMenu input-field popup)))
+    (.setComponentPopupMenu console popup)))
 
 (defn setup-undo! [^JTextComponent editor]
   (let [undo-mgr (javax.swing.undo.UndoManager.)
@@ -1377,7 +1294,6 @@
           (reify UndoableEditListener
             (undoableEditHappened [_ e]
               (let [edit (.getEdit e)]
-                ;; Filter out style-only attribute changes from undo history
                 (when-not (and (instance? AbstractDocument$DefaultDocumentEvent edit)
                                (= (.getType ^AbstractDocument$DefaultDocumentEvent edit)
                                   DocumentEvent$EventType/CHANGE))
@@ -1473,18 +1389,9 @@
 ;; --- Multi-Window Management ---
 
 (def active-windows
-  "Tracks all active DrClojure IDE frames mapped to their window context handlers:
-   {frame {:frame frame
-           :prompt-save-fn (fn [] ...)
-           :close-fn (fn [] ...)
-           :file-new-fn (fn [] ...)
-           :cur-file-atom cur-file
-           :dirty?-atom dirty?}}"
   (atom {}))
 
 (def exit-handler
-  "Function invoked when all windows are closed or application exits.
-   Defaults to (System/exit 0)."
   (atom (fn [] (System/exit 0))))
 
 (declare open-ide-window!)
@@ -1507,7 +1414,7 @@
         dirty? (atom false)
         font-size (atom 14)
 
-        ;; Components: Editor (JTextPane with horizontal scroll support) & Line numbers
+        ;; Definitions Editor & Line Numbers
         doc (DefaultStyledDocument.)
         editor (proxy [JTextPane] [doc]
                  (getScrollableTracksViewportWidth []
@@ -1534,25 +1441,48 @@
         highlight-now! (:highlight-now! syntax-controller)
         bracket-info (:bracket-info syntax-controller)
 
-        ;; Components: Output & REPL input
-        output-area (JTextArea. 10 80)
-        _ (do (.setName output-area "output-area")
-              (.setEditable output-area false)
-              (.setBackground output-area (Color. 250 250 250))
-              (.setForeground output-area (Color. 30 30 30)))
-        output-scroll (JScrollPane. output-area)
-        prompt-label (JLabel. " > ")
-        _ (.setFont prompt-label (Font. Font/MONOSPACED Font/BOLD 14))
-        input-field (JTextField.)
-        _ (.setName input-field "repl-input")
-        prompt-panel (JPanel. (BorderLayout. 4 0))
-        _ (do (.add prompt-panel prompt-label BorderLayout/WEST)
-              (.add prompt-panel input-field BorderLayout/CENTER))
-        interactions-panel (JPanel. (BorderLayout. 0 4))
-        _ (do (.add interactions-panel output-scroll BorderLayout/CENTER)
-              (.add interactions-panel prompt-panel BorderLayout/SOUTH))
+        ;; --- Unified Interactions Console (Output + REPL input) ---
+        interactions-doc (DefaultStyledDocument.)
+        interactions-pane (proxy [JTextPane] [interactions-doc]
+                            (getScrollableTracksViewportWidth []
+                              (let [parent (.getParent this)]
+                                (if (instance? JViewport parent)
+                                  (>= (.getWidth parent) (.. this getUI (getPreferredSize this) width))
+                                  true))))
+        _ (do (.setName interactions-pane "interactions-console")
+              (.setMargin interactions-pane (Insets. 4 6 4 6))
+              (.setBackground interactions-pane (Color. 250 250 250))
+              (.setCaretColor interactions-pane (Color. 30 30 30)))
+        interactions-scroll (JScrollPane. interactions-pane)
+        interactions-panel (JPanel. (BorderLayout.))
+        _ (.add interactions-panel interactions-scroll BorderLayout/CENTER)
 
-        ;; Split Pane: Top = Definitions, Bottom = Interactions
+        ;; Styles for console segments
+        attr-normal (let [a (SimpleAttributeSet.)]
+                      (StyleConstants/setForeground a (Color. 40 40 40))
+                      (StyleConstants/setBold a false)
+                      a)
+        attr-prompt (let [a (SimpleAttributeSet.)]
+                      (StyleConstants/setForeground a (Color. 0 100 200))
+                      (StyleConstants/setBold a true)
+                      a)
+        attr-result (let [a (SimpleAttributeSet.)]
+                      (StyleConstants/setForeground a (Color. 20 120 40))
+                      (StyleConstants/setBold a true)
+                      a)
+        attr-error (let [a (SimpleAttributeSet.)]
+                     (StyleConstants/setForeground a (Color. 180 20 20))
+                     (StyleConstants/setBold a false)
+                     a)
+        attr-system (let [a (SimpleAttributeSet.)]
+                      (StyleConstants/setForeground a (Color. 110 110 110))
+                      (StyleConstants/setItalic a true)
+                      a)
+
+        prompt-start-pos (atom 0)
+        current-prompt-str (atom "user=> ")
+
+        ;; Split Pane: Top = Definitions, Bottom = Unified Interactions
         split-pane (JSplitPane. JSplitPane/VERTICAL_SPLIT definitions-panel interactions-panel)
         _ (do (.setResizeWeight split-pane 0.6)
               (.setDividerLocation split-pane 380))
@@ -1577,7 +1507,6 @@
         btn-font-plus (JButton. "A+")
         btn-font-minus (JButton. "A-")
 
-        ;; File Chooser
         fc (JFileChooser.)
         _ (.setFileFilter fc (javax.swing.filechooser.FileNameExtensionFilter. "Clojure files (*.clj, *.cljc, *.edn)" (into-array ["clj" "cljc" "edn"])))
 
@@ -1587,13 +1516,10 @@
 
     ;; --- Setup Fonts ---
     (letfn [(apply-font! [sz]
-              (let [f (Font. Font/MONOSPACED Font/PLAIN sz)
-                    fb (Font. Font/MONOSPACED Font/BOLD sz)]
+              (let [f (Font. Font/MONOSPACED Font/PLAIN sz)]
                 (.setFont editor f)
                 (.setFont line-numbers f)
-                (.setFont output-area f)
-                (.setFont input-field f)
-                (.setFont prompt-label fb)
+                (.setFont interactions-pane f)
                 (update-line-numbers! editor line-numbers)))]
       (apply-font! @font-size)
 
@@ -1610,26 +1536,72 @@
                     (reset! dirty? is-dirty?)
                     (update-title!))))
 
-              (append-output! [text]
+              ;; Console text append helpers
+              (append-styled-text! [text attr]
+                (let [len (.getLength interactions-doc)]
+                  (.insertString interactions-doc len text attr)
+                  (reset! prompt-start-pos (.getLength interactions-doc))
+                  (.setCaretPosition interactions-pane @prompt-start-pos)))
+
+              (append-console! [text]
                 (SwingUtilities/invokeLater
                   (fn []
-                    (.append output-area text)
-                    (.setCaretPosition output-area (.. output-area getDocument getLength)))))]
+                    (let [len (.getLength interactions-doc)
+                          target-pos @prompt-start-pos]
+                      (if (>= target-pos len)
+                        (do
+                          (.insertString interactions-doc len text attr-normal)
+                          (reset! prompt-start-pos (.getLength interactions-doc)))
+                        (do
+                          (.insertString interactions-doc target-pos text attr-normal)
+                          (swap! prompt-start-pos + (.length ^String text))))
+                      (.setCaretPosition interactions-pane (.getLength interactions-doc))))))
 
-        ;; Startup Banner
+              (insert-new-prompt! [prompt-str]
+                (SwingUtilities/invokeLater
+                  (fn []
+                    (let [len (.getLength interactions-doc)]
+                      (when (and (pos? len)
+                                 (not= (.getText interactions-doc (dec len) 1) "\n"))
+                        (.insertString interactions-doc len "\n" attr-normal))
+                      (let [new-len (.getLength interactions-doc)]
+                        (reset! current-prompt-str prompt-str)
+                        (.insertString interactions-doc new-len prompt-str attr-prompt)
+                        (reset! prompt-start-pos (.getLength interactions-doc))
+                        (.setCaretPosition interactions-pane @prompt-start-pos))))))
+
+              (get-current-command []
+                (let [p-start @prompt-start-pos
+                      len (.getLength interactions-doc)]
+                  (if (> len p-start)
+                    (.getText interactions-doc p-start (- len p-start))
+                    "")))
+
+              (set-current-command! [new-cmd]
+                (let [p-start @prompt-start-pos
+                      len (.getLength interactions-doc)]
+                  (when (> len p-start)
+                    (.remove interactions-doc p-start (- len p-start)))
+                  (.insertString interactions-doc p-start new-cmd attr-normal)
+                  (.setCaretPosition interactions-pane (.getLength interactions-doc))))]
+
+        ;; Banner Initialization
         (letfn [(print-banner! []
                   (let [c-ver (clojure-version)
-                        j-ver (System/getProperty "java.version")]
-                    (.setText output-area "")
-                    (append-output!
-                      (str "============================================================\n"
-                           " " app-name " " app-version "  |  Clojure " c-ver "  |  Java " j-ver "\n"
-                           "============================================================\n"
-                           " Definitions (Top): Type Clojure code and press [Run] or F5\n"
-                           " Interactions (Bottom): REPL expressions & GUI standard input\n"
-                           " Stdin Console: Use (read-line) in code; input is prompted below\n"
-                           " Cheatsheet: Click [Cheatsheet] or press F1 to open Clojure Cheatsheet in browser\n"
-                           "------------------------------------------------------------\n"))))]
+                        j-ver (System/getProperty "java.version")
+                        banner (str "============================================================\n"
+                                    " " app-name " " app-version "  |  Clojure " c-ver "  |  Java " j-ver "\n"
+                                    "============================================================\n"
+                                    " Definitions (Top): Type Clojure code and press [Run] or F5\n"
+                                    " Interactions (Bottom): Type Clojure expressions or standard input here\n"
+                                    " Stdin Console: Use (read-line) in code; input is entered directly at prompt\n"
+                                    " Cheatsheet: Click [Cheatsheet] or press F1 to open Clojure Cheatsheet\n"
+                                    "------------------------------------------------------------\n")]
+                    (SwingUtilities/invokeLater
+                      (fn []
+                        (.setText interactions-pane "")
+                        (append-styled-text! banner attr-system)
+                        (insert-new-prompt! "user=> ")))))]
           (print-banner!)
 
           ;; Status Updater
@@ -1644,15 +1616,11 @@
                               (.setEnabled btn-stop true))
                           (= st :waiting-input)
                           (do (.setText status-state " ● Waiting for input... ")
-                              (.setForeground status-state (Color. 0 100 220))
-                              (.setText prompt-label " [stdin] > ")
-                              (.setForeground prompt-label (Color. 0 100 220))
-                              (.requestFocusInWindow input-field))
+                              (.setForeground status-state (Color. 0 100 220))                              
+                              (.requestFocusInWindow interactions-pane))
                           (= st :idle)
                           (do (.setText status-state " ● Ready ")
                               (.setForeground status-state (Color. 0 130 0))
-                              (.setText prompt-label " > ")
-                              (.setForeground prompt-label (Color. 0 0 0))
                               (.setEnabled btn-run true)
                               (.setEnabled btn-stop false))
                           (string? st)
@@ -1663,22 +1631,29 @@
             ;; --- Evaluation Logic ---
             (letfn [(run-code-string! [code-str]
                       (eval/eval-async eval-ctx code-str
-                        {:on-output append-output!
+                        {:on-output append-console!
                          :on-status-change set-status!
                          :on-complete (fn [res]
-                                        (case (:status res)
-                                          :ok
-                                          (append-output! (str "=> " (eval/format-value (:value res)) "\n"))
-                                          :error
-                                          (append-output! (str (eval/format-error (:error res)) "\n"))
-                                          :interrupted
-                                          (append-output! "; [Evaluation stopped by user]\n")
-                                          nil))}))
+                                        (SwingUtilities/invokeLater
+                                          (fn []
+                                            (case (:status res)
+                                              :ok
+                                              (append-styled-text! (str "=> " (eval/format-value (:value res)) "\n") attr-result)
+                                              :error
+                                              (append-styled-text! (str (eval/format-error (:error res)) "\n") attr-error)
+                                              :interrupted
+                                              (append-styled-text! "; [Evaluation stopped by user]\n" attr-system)
+                                              nil)
+                                            (when-not (eval/waiting-for-input? eval-ctx)
+                                              (insert-new-prompt! "user=> "))
+                                            (.requestFocusInWindow interactions-pane))))}))
 
                     (run-definitions! []
                       (let [code (.getText editor)]
-                        (append-output! "\n; --- Running Definitions ---\n")
-                        (run-code-string! code)))
+                        (SwingUtilities/invokeLater
+                          (fn []
+                            (append-styled-text! "\n; --- Running Definitions ---\n" attr-system)
+                            (run-code-string! code)))))
 
                     (run-selection! []
                       (let [sel (.getSelectedText editor)
@@ -1692,12 +1667,15 @@
                                          end (.getEndOffset line-elem)]
                                      (.getText editor start (- end start))))]
                         (when-not (str/blank? code)
-                          (append-output! (str "\n; --- Running Selection ---\n" code "\n"))
-                          (run-code-string! code))))
+                          (SwingUtilities/invokeLater
+                            (fn []
+                              (append-styled-text! (str "\n; --- Running Selection ---\n" code "\n") attr-system)
+                              (run-code-string! code))))))
 
                     (stop-current-eval! []
                       (eval/stop-eval! eval-ctx)
-                      (set-status! :idle))
+                      (set-status! :idle)
+                      (insert-new-prompt! "user=> "))
 
                     (jump-action! []
                       (jump-to-definition! frame editor))
@@ -1723,23 +1701,22 @@
                     (quick-doc-action! []
                       (show-quick-doc! frame editor))
 
-                    (repl-autocomplete-action! []
+                    (console-autocomplete-action! []
                       (let [editor-text (fn [] (.getText (.getDocument editor) 0 (.getLength (.getDocument editor))))]
-                        (trigger-autocomplete! input-field set-status! active-popup nil nil editor-text input-autocomplete-committed)))
+                        (trigger-autocomplete! interactions-pane set-status! active-popup nil nil editor-text input-autocomplete-committed)))
 
                     (autocomplete-action! []
-                      (if (.hasFocus input-field)
-                        (repl-autocomplete-action!)
+                      (if (.hasFocus interactions-pane)
+                        (console-autocomplete-action!)
                         (trigger-autocomplete! editor set-status! active-popup highlight-now! update-dirty!)))
 
                     (send-stdin-eof! []
                       (when (eval/waiting-for-input? eval-ctx)
                         (when @active-popup
                           (dismiss-autocomplete! active-popup))
-                        (let [text (.getText input-field)]
-                          (.setText input-field "")
+                        (let [text (get-current-command)]
+                          (append-styled-text! "\n" attr-normal)
                           (when-not (empty? text)
-                            (append-output! (str text "\n"))
                             (eval/push-stdin! eval-ctx text))
                           (eval/push-stdin-eof! eval-ctx))))]
 
@@ -1752,24 +1729,29 @@
                     find-prev! (:find-prev! find-ctrl)]
                 (.add definitions-panel find-panel BorderLayout/SOUTH)
 
-                ;; Autocomplete for REPL input field
-                (.setFocusTraversalKeys input-field KeyboardFocusManager/FORWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
-                (setup-autocomplete-keys! input-field active-popup)
-                (setup-input-field-context-menu! input-field repl-autocomplete-action!)
+                ;; --- Interactions Console Key Bindings & Stdin Handlers ---
+                (.setFocusTraversalKeys interactions-pane KeyboardFocusManager/FORWARD_TRAVERSAL_KEYS java.util.Collections/EMPTY_SET)
+                (setup-autocomplete-keys! interactions-pane active-popup)
+                (setup-interactions-context-menu! interactions-pane console-autocomplete-action! print-banner!)
 
-                (let [im (.getInputMap input-field JComponent/WHEN_FOCUSED)
-                      am (.getActionMap input-field)]
-                  (.put im (KeyStroke/getKeyStroke "control SPACE") "repl-autocomplete")
-                  (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SPACE KeyEvent/CTRL_DOWN_MASK) "repl-autocomplete")
-                  (.put im (KeyStroke/getKeyStroke "TAB") "repl-autocomplete")
-                  (.put am "repl-autocomplete"
+                (let [im (.getInputMap interactions-pane JComponent/WHEN_FOCUSED)
+                      am (.getActionMap interactions-pane)]
+                  (.put im (KeyStroke/getKeyStroke "control SPACE") "console-autocomplete")
+                  (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SPACE KeyEvent/CTRL_DOWN_MASK) "console-autocomplete")
+                  (.put im (KeyStroke/getKeyStroke "TAB") "console-autocomplete")
+                  (.put am "console-autocomplete"
                     (proxy [javax.swing.AbstractAction] []
                       (actionPerformed [e]
                         (if @active-popup
                           (commit-autocomplete! active-popup)
-                          (repl-autocomplete-action!)))))
+                          (console-autocomplete-action!)))))
 
-                  ;; Ctrl+D in stdin textfield sends EOF
+                  (.put im (KeyStroke/getKeyStroke "control L") "clear-console")
+                  (.put am "clear-console"
+                    (proxy [javax.swing.AbstractAction] []
+                      (actionPerformed [e]
+                        (print-banner!))))
+
                   (.put im (KeyStroke/getKeyStroke "control D") "stdin-eof")
                   (.put im (KeyStroke/getKeyStroke KeyEvent/VK_D KeyEvent/CTRL_DOWN_MASK) "stdin-eof")
                   (.put am "stdin-eof"
@@ -1777,51 +1759,68 @@
                       (actionPerformed [e]
                         (send-stdin-eof!)))))
 
-                ;; --- Input Field Action (REPL & Stdin) ---
-                (.addActionListener input-field
-                  (proxy [ActionListener] []
-                    (actionPerformed [e]
-                      (when-not (or @input-autocomplete-committed @active-popup)
-                        (let [text (.getText input-field)]
-                          (.setText input-field "")
-                          (if (eval/waiting-for-input? eval-ctx)
-                            ;; Process GUI stdin input
-                            (do
-                              (append-output! (str text "\n"))
-                              (eval/push-stdin! eval-ctx text))
-                            ;; Process REPL expression
-                            (if (eval/evaluating? eval-ctx)
-                              (append-output! "; [Warning: Code is currently running. Click Stop to cancel.]\n")
-                              (when-not (str/blank? text)
-                                (swap! (:history eval-ctx) eval/history-add text)
-                                (append-output! (str "> " text "\n"))
-                                (run-code-string! text)))))))))
-
-                ;; History navigation on Up / Down arrow & Ctrl+D EOF
-                (.addKeyListener input-field
+                ;; Protect prior output from edits; route Enter / Up / Down
+                (.addKeyListener interactions-pane
                   (proxy [KeyAdapter] []
                     (keyPressed [e]
-                      (when-not (.isConsumed e)
-                        (cond
-                          (and (= (.getKeyCode e) KeyEvent/VK_D)
-                               (pos? (bit-and (.getModifiersEx e) KeyEvent/CTRL_DOWN_MASK)))
+                      (let [code (.getKeyCode e)
+                            caret (.getCaretPosition interactions-pane)
+                            p-start @prompt-start-pos]
+                        ;; Guard backspace/delete before prompt boundary
+                        (when (and (= code KeyEvent/VK_BACK_SPACE)
+                                   (<= caret p-start)
+                                   (= (.getSelectionStart interactions-pane) (.getSelectionEnd interactions-pane)))
+                          (.consume e))
+                        (when (and (= code KeyEvent/VK_DELETE)
+                                   (< caret p-start))
+                          (.consume e))
+
+                        ;; Ctrl+D stdin EOF
+                        (when (and (= code KeyEvent/VK_D)
+                                   (pos? (bit-and (.getModifiersEx e) KeyEvent/CTRL_DOWN_MASK)))
                           (when (eval/waiting-for-input? eval-ctx)
                             (.consume e)
-                            (send-stdin-eof!))
+                            (send-stdin-eof!)))
 
-                          (and (not @active-popup) (= (.getKeyCode e) KeyEvent/VK_UP))
-                          (do
+                        ;; Enter: submit code or standard input
+                        (when (= code KeyEvent/VK_ENTER)
+                          (when-not (or @input-autocomplete-committed @active-popup)
                             (.consume e)
-                            (let [[new-hist display-text] (eval/history-prev @(:history eval-ctx) (.getText input-field))]
-                              (reset! (:history eval-ctx) new-hist)
-                              (.setText input-field display-text)))
+                            (let [cmd (get-current-command)]
+                              ;; Append newline and move prompt-start-pos so stdout starts on new line
+                              (append-styled-text! "\n" attr-normal)
+                              (if (eval/waiting-for-input? eval-ctx)
+                                (eval/push-stdin! eval-ctx cmd)
+                                (if (eval/evaluating? eval-ctx)
+                                  (do
+                                    (append-styled-text! "; [Warning: Code is currently running. Press Stop to cancel.]\n" attr-system)
+                                    (insert-new-prompt! "user=> "))
+                                  (if (str/blank? cmd)
+                                    (insert-new-prompt! "user=> ")
+                                    (do
+                                      (swap! (:history eval-ctx) eval/history-add cmd)
+                                      (run-code-string! cmd))))))))
 
-                          (and (not @active-popup) (= (.getKeyCode e) KeyEvent/VK_DOWN))
-                          (do
-                            (.consume e)
-                            (let [[new-hist display-text] (eval/history-next @(:history eval-ctx))]
-                              (reset! (:history eval-ctx) new-hist)
-                              (.setText input-field display-text))))))))
+                        ;; History traversal on Up / Down
+                        (when (and (not @active-popup) (= code KeyEvent/VK_UP))
+                          (.consume e)
+                          (let [[new-hist display-text] (eval/history-prev @(:history eval-ctx) (get-current-command))]
+                            (reset! (:history eval-ctx) new-hist)
+                            (set-current-command! display-text)))
+
+                        (when (and (not @active-popup) (= code KeyEvent/VK_DOWN))
+                          (.consume e)
+                          (let [[new-hist display-text] (eval/history-next @(:history eval-ctx))]
+                            (reset! (:history eval-ctx) new-hist)
+                            (set-current-command! display-text)))))
+
+                    (keyTyped [e]
+                      (let [caret (.getCaretPosition interactions-pane)
+                            p-start @prompt-start-pos]
+                        ;; Prevent typing prior to prompt
+                        (when (and (< caret p-start)
+                                   (not (contains? #{KeyEvent/VK_BACK_SPACE KeyEvent/VK_DELETE} (int (.getKeyChar e)))))
+                          (.setCaretPosition interactions-pane (.getLength interactions-doc)))))))
 
                 ;; Wire toolbar buttons
                 (.addActionListener btn-run (proxy [ActionListener] [] (actionPerformed [e] (run-definitions!))))
@@ -1846,7 +1845,6 @@
                 (setup-editor-keys! editor comment-action!)
                 (setup-autocomplete-keys! editor active-popup)
 
-                ;; Editor shortcuts for Run Definitions, Jump to Definition, Rename, Quick Doc, Autocomplete, Find/Replace, Escape
                 (let [im (.getInputMap editor)
                       am (.getActionMap editor)]
                   (.put im (KeyStroke/getKeyStroke "F5") "run-definitions")
@@ -1873,7 +1871,6 @@
                     (proxy [javax.swing.AbstractAction] []
                       (actionPerformed [e] (quick-doc-action!))))
 
-                  ;; Autocomplete (Ctrl+Space)
                   (.put im (KeyStroke/getKeyStroke "control SPACE") "autocomplete")
                   (.put im (KeyStroke/getKeyStroke KeyEvent/VK_SPACE KeyEvent/CTRL_DOWN_MASK) "autocomplete")
                   (.put am "autocomplete"
@@ -1901,7 +1898,6 @@
                     (proxy [javax.swing.AbstractAction] []
                       (actionPerformed [e] (find-prev!))))
 
-                  ;; Format All (Ctrl+Shift+F) & Format Selection (Ctrl+Alt+F, Ctrl+Alt+L)
                   (.put im (KeyStroke/getKeyStroke "control shift F") "format-all")
                   (.put am "format-all"
                     (proxy [javax.swing.AbstractAction] []
@@ -2032,7 +2028,6 @@
                                     (str "Failed to open file:\n" (.getMessage ex))
                                     "Error" JOptionPane/ERROR_MESSAGE)))))))]
 
-                ;; Register window in active-windows map
                 (swap! active-windows assoc frame
                   {:frame frame
                    :prompt-save-fn prompt-save-if-dirty!
@@ -2041,7 +2036,6 @@
                    :cur-file-atom cur-file
                    :dirty?-atom dirty?})
 
-                ;; Highlight initial file if loaded
                 (when-not (empty? init-content)
                   (highlight-now!))
 
@@ -2050,7 +2044,6 @@
 
                 ;; --- Menu Bar ---
                 (let [menu-bar (JMenuBar.)
-                      ;; File Menu
                       menu-file (JMenu. "File")
                       _ (.setMnemonic menu-file (int \F))
                       item-new (JMenuItem. "New" (int \N))
@@ -2078,7 +2071,6 @@
                             (.add menu-file item-close)
                             (.add menu-file item-exit))
 
-                      ;; Edit Menu
                       menu-edit (JMenu. "Edit")
                       _ (.setMnemonic menu-edit (int \E))
                       item-undo (JMenuItem. "Undo")
@@ -2150,7 +2142,6 @@
                             (.addSeparator menu-edit)
                             (.add menu-edit item-clear))
 
-                      ;; Run Menu
                       menu-run (JMenu. "Run")
                       _ (.setMnemonic menu-run (int \R))
                       item-run-def (JMenuItem. "Run Definitions")
@@ -2166,7 +2157,6 @@
                             (.add menu-run item-run-sel)
                             (.add menu-run item-stop))
 
-                      ;; View Menu
                       menu-view (JMenu. "View")
                       _ (.setMnemonic menu-view (int \V))
                       item-zoom-in (JMenuItem. "Zoom In")
@@ -2182,7 +2172,6 @@
                             (.add menu-view item-zoom-out)
                             (.add menu-view item-zoom-reset))
 
-                      ;; Help Menu
                       menu-help (JMenu. "Help")
                       _ (.setMnemonic menu-help (int \H))
                       item-cheat (JMenuItem. "Clojure Cheatsheet")
@@ -2238,7 +2227,6 @@
                     (.add content-pane status-panel BorderLayout/SOUTH)
                     (.setContentPane frame content-pane)
 
-                    ;; Window closing handler
                     (.setDefaultCloseOperation frame JFrame/DO_NOTHING_ON_CLOSE)
                     (.addWindowListener frame
                       (proxy [WindowAdapter] []
@@ -2247,7 +2235,6 @@
                         (windowClosed [e]
                           (swap! active-windows dissoc frame))))
 
-                    ;; Layout frame
                     (.setPreferredSize frame (Dimension. 950 720))
                     (.pack frame)
                     (.setLocationRelativeTo frame nil)
@@ -2255,8 +2242,6 @@
                     frame)))))))))))
 
 (defn open-ide-window!
-  "Creates, positions, and displays a new DrClojure window.
-   If parent-frame is provided and showing, cascades the new window relative to parent-frame."
   ([] (open-ide-window! nil nil))
   ([initial-file] (open-ide-window! initial-file nil))
   ([initial-file parent-frame]

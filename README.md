@@ -42,7 +42,7 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 +-------------------------------------------------------------+
 | File   Edit   Run   View   Help                             |
 +-------------------------------------------------------------+
-|[▶ Run] [⏹ Stop] | [Clear] | [A+] [A-]          [Cheatsheet]|
+|[▶ Run] [⏹ Stop] | [Find] [Clear] | [A+] [A-]   [Cheatsheet]|
 +-------------------------------------------------------------+
 | Definitions:                                                |
 |   1 | (defn greet []                                        |
@@ -57,8 +57,6 @@ DrClojure is a newbie-friendly Clojure IDE inspired by DrRacket, written in Cloj
 |   World                                                     |
 |   Hello, World!                                             |
 |   => nil                                                    |
-+-------------------------------------------------------------+
-| [stdin] > [                                                ]|
 +-------------------------------------------------------------+
 | Line 5, Col 9                                       ● Ready |
 +-------------------------------------------------------------+
