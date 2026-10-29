@@ -1170,7 +1170,12 @@
         (if (= l target-line)
           (let [line-len (.length ^String (nth lines l))]
             (+ off (int (max 0 (min (int x) line-len)))))
-          (recur (inc l) (+ off (.length ^String (nth lines l)) 1)))))))
+          (let [line-len (.length ^String (nth lines l))
+                ending-len (if (and (< (+ off line-len) (.length text))
+                                    (= \return (.charAt text (+ off line-len))))
+                             2
+                             1)]
+            (recur (inc l) (+ off line-len ending-len))))))))
 
 (defn compute-text-change
   "Computes change map `{:line-no :x :old-text :new-text}` between `old-text` and `new-text`."

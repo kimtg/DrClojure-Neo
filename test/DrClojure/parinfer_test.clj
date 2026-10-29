@@ -77,6 +77,20 @@
       (is (= 6 (parinfer/line-col->offset txt 1 2)))
       (is (= 10 (parinfer/line-col->offset txt 2 2)))))
 
+  (testing "offset->line-col and line-col->offset agree on CRLF text"
+    (let [txt "ab\r\ncd"]
+      (is (= [1 1] (parinfer/offset->line-col txt 5)))
+      (is (= 5 (parinfer/line-col->offset txt 1 1))))
+    (let [txt "(a\r\nbb\r\n  c)"]
+      (doseq [off (range (inc (count txt)))
+              ;; the offset between \r and \n has no line/column address;
+              ;; both functions clamp it to the start of the line ending
+              :when (not (and (pos? off) (< off (count txt))
+                              (= \return (nth txt (dec off)))))]
+        (let [[l x] (parinfer/offset->line-col txt off)]
+          (is (= off (parinfer/line-col->offset txt l x))
+              (str "offset " off))))))
+
   (testing "compute-text-change"
     (let [change (parinfer/compute-text-change "(foo)" "(foo bar)")]
       (is (= 0 (:line-no change)))
